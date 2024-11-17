@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<server description="SI3_ServerD Entwicklung">
+    <featureManager>
+        <feature>microProfile-2.2</feature>
+        <feature>appSecurity-3.0</feature>
+        <feature>jpa-2.2</feature>
+        <feature>jms-2.0</feature>
+        <feature>wmqJmsClient-2.0</feature>
+        <feature>beanValidation-2.0</feature>
+        <feature>ejb-3.2</feature>
+        <feature>batch-1.0</feature>
+        <feature>monitor-1.0</feature>
+        <feature>ssl-1.0</feature>
+        <feature>ejbPersistentTimer-3.2</feature>
+        <feature>concurrent-1.0</feature>
+        <feature>javaMail-1.5</feature>
+        <feature>requestTiming-1.0</feature>
+        <feature>usr:itcam-720.0020</feature>
+        <feature>httpWhiteboard-1.0</feature>
+        <feature>restConnector-2.0</feature>
+        <feature>ssl-1.0</feature>
+        <feature>zosWlm-1.0</feature>
+    </featureManager>
+    <webApplication id="SI3SBS.war" location="/ctl/wlp/E3/shared/apps/sissbs.war" name="SI3SBS-E" context-root="/at.gv.bmi.sissbs-e"/>
+    <dataSource id="SI3SBS" jndiName="jdbc/SI3SBS" isolationLevel="TRANSACTION_READ_COMMITTED" statementCacheSize="10" queryTimeout="59" syncQueryTimeoutWithTransactionTimeout="false" queryTimeoutInterruptProcessingMode="2" type="javax.sql.XADataSource">
+        <jdbcDriver libraryRef="DB2JCC4Lib"/>
+        <connectionManager maxPoolSize="10" minPoolSize="1" purgePolicy="FailingConnectionOnly" connectionTimeout="5s"/>
+        <properties.db2.jcc currentSchema="SBSSW" databaseName="DSS1" serverName="DSS1.rz.bmi.intra.gv.at" portNumber="446" user="${ds1.user}" password="${ds1.password}" clientApplicationInformation="SI3SBS-E" enableSysplexWLB="false" interruptProcessingMode="1" clientProgramName="LSE3S22D" clientProgramId="SI3SBS-E" currentPackageSet="E3S" timerLevelForQueryTimeOut="2" retrieveMessagesFromServerOnGetMessage="false"/>
+    </dataSource>
+    <dataSource id="batchDataSource" jndiName="jdbc/BatchDatabaseStore" isolationLevel="TRANSACTION_READ_COMMITTED" statementCacheSize="10" queryTimeout="59" syncQueryTimeoutWithTransactionTimeout="false" queryTimeoutInterruptProcessingMode="2">
+        <jdbcDriver libraryRef="DB2JCC4Lib"/>
+        <connectionManager maxPoolSize="10" minPoolSize="1" purgePolicy="FailingConnectionOnly" connectionTimeout="5s"/>
+        <properties.db2.jcc currentSchema="WLPE3" databaseName="DSS1" serverName="DSS1.rz.bmi.intra.gv.at" portNumber="446" user="${ds2.user}" password="${ds2.password}" clientApplicationInformation="SI3SBS-E" enableSysplexWLB="false" interruptProcessingMode="1" clientProgramName="LSE3S22D" clientProgramId="SI3SBS-E" currentPackageSet="E3S" timerLevelForQueryTimeOut="2" retrieveMessagesFromServerOnGetMessage="false"/>
+    </dataSource>
+    <dataSource id="timerDataSource" jndiName="jdbc/timer" isolationLevel="TRANSACTION_READ_COMMITTED" statementCacheSize="10" queryTimeout="59" syncQueryTimeoutWithTransactionTimeout="false" queryTimeoutInterruptProcessingMode="2">
+        <jdbcDriver libraryRef="DB2JCC4Lib"/>
+        <connectionManager maxPoolSize="10" minPoolSize="1" purgePolicy="FailingConnectionOnly" connectionTimeout="5s"/>
+        <properties.db2.jcc currentSchema="WLPE3" databaseName="DSS1" serverName="DSS1.rz.bmi.intra.gv.at" portNumber="446" user="${ds3.user}" password="${ds3.password}" clientApplicationInformation="SI3SBS-E" enableSysplexWLB="false" interruptProcessingMode="1" clientProgramName="LSE3S22D" clientProgramId="SI3SBS-E" currentPackageSet="E3S" timerLevelForQueryTimeOut="2" retrieveMessagesFromServerOnGetMessage="false"/>
+    </dataSource>
+    <httpEndpoint id="defaultHttpEndpoint" httpPort="19080" httpsPort="19443" host="LSE3S22D.rz.bmi.intra.gv.at">
+        <accessLogging enabled="true" logFormat="%h %i %u %t &quot;%r&quot; %s %b %D"/>
+    </httpEndpoint>
+    <iiopEndpoint id="defaultIiopEndpoint" iiopPort="12809" host="LSE3S22D.rz.bmi.intra.gv.at">
+        <iiopsOptions sslRef="defaultSSLConfig" iiopsPort="19402"/>
+    </iiopEndpoint>
+    <library id="DB2JCC4Lib">
+        <fileset dir="/prd/link/db2/wlp/E3_BMIS/jdbc/classes" includes="db2jcc4.jar db2jcc_license_cisuz.jar"/>
+    </library>
+    <jndiEntry id="propertypath_SI3SBS" decode="false" jndiName="cell/persistent/string/propertypath_SI3SBS" value="/appl/e/si3/sbs/"/>
+    <jndiEntry id="propertyfile_SI3SBS" decode="false" jndiName="cell/persistent/string/propertyfile_SI3SBS" value="si3sbs.properties"/>
+    <jndiEntry id="log_propertyfile_SI3SBS" decode="false" jndiName="cell/persistent/string/log_propertyfile_SI3SBS" value="logback.xml"/>
+    <jndiEntry id="masspath_SI3SBS" decode="false" jndiName="cell/persistent/string/masspath_SI3SBS" value="/mass/e/si3/sbs"/>
+    <webAppSecurity singleSignonEnabled="false"/>
+    <pluginConfiguration connectTimeout="5s" pluginInstallRoot="/prd/wlp/wlp900/b/plg" serverIOTimeout="305s" sslKeyringLocation="/ctl/wlp/E3/shared/resources/WLPKeyStore.kdb" sslStashfileLocation="/ctl/wlp/E3/shared/resources/WLPKeyStore.sth"/>
+    <httpSession id="HttpSession" cloneId="ID_LSE3S22D" cookieName="SI3_7_E_JSESSION" useContextRootAsCookiePath="true"/>
+    <basicRegistry id="basic" realm="customRealm">
+        <user name="wlpadmin" password="${wlpadmin.user.password}"/>
+        <user name="grafana" password="${grafana.user.password}"/>
+    </basicRegistry>
+    <administrator-role>
+        <user>wlpadmin</user>
+    </administrator-role>
+    <reader-role>
+        <user>grafana</user>
+    </reader-role>
+    <applicationMonitor dropinsEnabled="false" updateTrigger="disabled"/>
+    <config updateTrigger="disabled"/>
+    <applicationManager  autoExpand="true"/>
+    <wlmClassification >
+        <httpClassification  transactionClass="TCSI3SBS" host="*" port="*" resource="/at.gv.bmi.sissbs-e/*"/>
+        <httpClassification  transactionClass="TCSI3SBS" host="*" port="*" resource="/at.gv.bmi.sissbs-e/**/*"/>
+        <httpClassification  transactionClass="TCSI3" host="*" port="*"/>
+    </wlmClassification >
+    <mailSession  mailSessionID="DefaultMailSession" description="Default Mail Session" jndiName="mail/MailSession" host="SMTP1101A.bmi-net.local" user="" password="" from="wlp@bmi-net.local"/>
+    <keyStore id="defaultKeyStore" location="/ctl/wlp/E3/shared/resources/WLPJKeyStore.jks" type="JKS" password="${keyStore.password}"/>
+    <webContainer deferServletLoad="false" logServletContainerInitializerClassLoadingErrors="false" com.ibm.ws.webcontainer.suppresserrorpageodrheader="true"/>
+    <variable name="wmqJmsClient.rar.location" value="/prd/link/mqm/wlp/E3_BMIS/java/lib/jca/wmq.jmsra.rar"/>
+    <jmsConnectionFactory id="QM" jndiName="jms/qm">
+        <connectionManager agedTimeout="0"/>
+        <properties.wmqJms transportType="CLIENT" queueManager="QMS1" hostName="QMS1" port="1414" channel="SI3.QMS1.SVRCONN" userName="USI3E" password="{xor}DBZvbGka"/>
+    </jmsConnectionFactory>
+    <jmsQueue id="SW.SI3.BAT.SISZWR" jndiName="jms/si3sbs/siszwr">
+        <properties.wmqJms baseQueueName="SW.SI3.BAT.SISZWR "/>
+    </jmsQueue>
+    <jmsQueue id="SW.SI3.BAT.SISZWR2" jndiName="jms/si3sbs/siszwrV2">
+        <properties.wmqJms baseQueueName="SW.SI3.BAT.SISZWR2"/>
+    </jmsQueue>
+    <requestTiming includeContextInfo="true" slowRequestThreshold="60s" hungRequestThreshold="10m" sampleRate="1" enableThreadDumps="false"/>
+    <httpDispatcher enableWelcomePage="false" appOrContextRootMissingMessage=""/>
+    <logging maxFileSize="10" maxFiles="10" traceFormat="BASIC"/>
+    <databaseStore id="EJBTimerDatabaseStore" tablePrefix="EJBTIMER_" dataSourceRef="timerDataSource" createTables="false" schema="WLPE3"/>
+    <databaseStore id="BatchDatabaseStore" tablePrefix="JBATCH_" dataSourceRef="batchDataSource" createTables="false" schema="WLPE3"/>
+    <persistentExecutor id="defaultEJBPersistentTimerExecutor" taskStoreRef="EJBTimerDatabaseStore" retryLimit="-1" initialPollDelay="20s" missedTaskThreshold="8m" pollInterval="2m" poolSize="1">
+        <contextService>
+            <classloaderContext/>
+            <jeeMetadataContext/>
+            <zosWLMContext id="ZosWLMContext" defaultTransactionClass="TCSI3BN" wlm="New"/>
+        </contextService>
+    </persistentExecutor>
+    <ejbContainer>
+        <timerService missedPersistentTimerAction="ONCE"/>
+    </ejbContainer>
+    <batchPersistence jobStoreRef="BatchDatabaseStore"/>
+    <authorization-roles id="com.ibm.ws.batch">
+        <security-role name="batchSubmitter">
+            <special-subject type="EVERYONE"/>
+        </security-role>
+        <security-role name="batchMonitor">
+            <special-subject type="ALL_AUTHENTICATED_USERS"/>
+        </security-role>
+    </authorization-roles>
+    <classloading useJarUrls="true"/>
+    <include id="trace_include" optional="true" location="trace.xml"/>
+</server>
