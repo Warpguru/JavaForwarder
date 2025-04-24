@@ -222,12 +222,16 @@ public class JavaForwarder {
 							+ serverSocket.getInetAddress().getHostAddress() + ":" + serverSocket.getPort() + " stopped");
 				}
 				if (Protocol.UDP == protocol) {
+					if (clientDatagramSocket.getInetAddress() != null) {
 					System.out.println("JavaForwarder " + protocol + " connection: "
-							+ clientDatagramSocket.getInetAddress().getHostAddress() + ":" + clientDatagramSocket.getPort()
-							+ " <--> " + serverDatagramSocket.getInetAddress().getHostAddress() + ":"
+							+ clientDatagramSocket.getInetAddress().getHostAddress() 
+							+ ":" 
+							+ clientDatagramSocket.getPort()
+							+ " <--> " 
+							+ serverDatagramSocket.getInetAddress().getHostAddress() + ":"
 							+ serverDatagramSocket.getPort() + " stopped");
+					}
 				}
-
 				forwardingActive = false;
 			}
 		}
