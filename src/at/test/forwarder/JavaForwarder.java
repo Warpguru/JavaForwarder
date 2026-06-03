@@ -9,16 +9,15 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
-import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -45,6 +44,14 @@ public class JavaForwarder {
         UDP
     };
 
+    /** Direction of data flow for {@link ForwardThread}. */
+    private static enum Direction {
+        /** Data flowing from client to server. */
+        CLIENT_TO_SERVER,
+        /** Data flowing from server to client. */
+        SERVER_TO_CLIENT
+    }    
+    
     /** Mode of forwarding operation, {@code TCP} (default) or {@code UDP}. */
     private static final String ENVIRONMENT_VARIABLE_MODE = "MODE";
     /** Set to any value to activate recording of the forwarded data in a formatted data dump. */
@@ -81,6 +88,8 @@ public class JavaForwarder {
         private DatagramSocket serverDatagramSocket;
         /** Flag set while forwarding is active. */
         private boolean forwardingActive = false;
+        /** Tracks which forwarding directions are still active (for half-close support). */
+        private volatile Map<Direction, Boolean> directionActive = new HashMap<>();
 
         /**
          * Client thread constructor to process {@code TCP} data.
@@ -97,6 +106,8 @@ public class JavaForwarder {
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
             this.serverSocket = null;
+            directionActive.put(Direction.CLIENT_TO_SERVER, true);
+            directionActive.put(Direction.SERVER_TO_CLIENT, true);
         }
 
         /**
@@ -116,6 +127,8 @@ public class JavaForwarder {
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
             this.serverSocket = null;
+            directionActive.put(Direction.CLIENT_TO_SERVER, true);
+            directionActive.put(Direction.SERVER_TO_CLIENT, true);
         }
 
         /**
@@ -156,10 +169,10 @@ public class JavaForwarder {
                 // Start forwarding data between client and server
                 forwardingActive = true;
                 ForwardThread clientForward = new ForwardThread(this, protocol, clientSocket, serverSocket, clientInputStream,
-                        serverOutputStream);
+                        serverOutputStream, Direction.CLIENT_TO_SERVER);
                 clientForward.start();
                 ForwardThread serverForward = new ForwardThread(this, protocol, serverSocket, clientSocket, serverInputStream,
-                        clientOutputStream);
+                        clientOutputStream, Direction.SERVER_TO_CLIENT);
                 serverForward.start();
                 System.out.println("JavaForwarder " + protocol + " connection: "
                         + clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort() + " <--> "
@@ -193,18 +206,64 @@ public class JavaForwarder {
         }
 
         /**
-         * Called by some of the forwarding threads to indicate that its socket connection is broken and both client and server
-         * sockets should be closed. Closing the client and server sockets causes all threads blocked on reading or writing to
+         * Called by ForwardThread when one direction of forwarding completes.
+         * Marks the direction as inactive and handles half-close scenarios.
+         * 
+         * @param direction which direction completed
+         */
+        public synchronized void forwardingDirectionComplete(Direction direction) {
+            directionActive.put(direction, false);
+            System.out.println("JavaForwarder: " + direction + " forwarding completed");
+            // When server closes (SERVER_TO_CLIENT completes), close the client socket
+            // to unblock CLIENT_TO_SERVER thread which is waiting on clientInputStream.read()
+            if (direction == Direction.SERVER_TO_CLIENT && clientSocket != null && !clientSocket.isClosed()) {
+                try {
+                    // Close client socket to make CLIENT_TO_SERVER thread exit
+                    clientSocket.close();
+                    System.out.println("JavaForwarder: Closed client socket to unblock CLIENT_TO_SERVER");
+                } catch (Exception e) {
+                    // Ignore - socket may already be closed
+                }
+            }
+            
+            // When client closes (CLIENT_TO_SERVER completes), close the server socket
+            // to unblock SERVER_TO_CLIENT thread which is waiting on serverInputStream.read()
+            if (direction == Direction.CLIENT_TO_SERVER && serverSocket != null && !serverSocket.isClosed()) {
+                try {
+                    // Close server socket to make SERVER_TO_CLIENT thread exit
+                    serverSocket.close();
+                    System.out.println("JavaForwarder: Closed server socket to unblock SERVER_TO_CLIENT");
+                } catch (Exception e) {
+                    // Ignore - socket may already be closed
+                }
+            }
+        }
+
+        /**
+         * Called by some of the forwarding threads to indicate that its socket connection is broken.
+         * Only closes sockets when BOTH directions have completed to support HTTP Keep-Alive.
+         * Closing the client and server sockets causes all threads blocked on reading or writing to
          * these sockets to get an exception and to finish their execution.
          */
         public synchronized void connectionBroken() {
-            if (serverSocket != null) {
+            // Check if any direction is still active
+            boolean anyDirectionActive = directionActive.values().stream().anyMatch(active -> active);
+            
+            if (anyDirectionActive) {
+                System.out.println("JavaForwarder: One direction closed, waiting for other direction");
+                return; // Don't close yet - other direction still active
+            }
+            
+            // Both directions finished - now close everything
+            System.out.println("JavaForwarder: Both directions closed, terminating connection");
+            
+            if (serverSocket != null && !serverSocket.isClosed()) {
                 try {
                     serverSocket.close();
                 } catch (Exception e) {
                 }
             }
-            if (clientSocket != null) {
+            if (clientSocket != null && !clientSocket.isClosed()) {
                 try {
                     clientSocket.close();
                 } catch (Exception e) {
@@ -307,6 +366,8 @@ public class JavaForwarder {
         final private InputStream inputStream;
         /** {@link OutputStream} to forward data to. */
         final private OutputStream outputStream;
+        /** Direction of data flow (client to server or server to client). */
+        final private Direction direction;
 
         /**
          * Creates a new {@code TCP} traffic forwarding (copy) thread specifying its parent, input and output {@link Socket}s
@@ -318,9 +379,10 @@ public class JavaForwarder {
          * @param outputSocket where {@code outputStream} writes data to
          * @param inputStream  to read data from
          * @param outputStream to forward data from {@code inputStream} to
+         * @param direction    of data flow (client to server or server to client)
          */
         public ForwardThread(final ClientThread clientThread, final Protocol protocol, final Socket inputSocket,
-                final Socket outputSocket, final InputStream inputStream, final OutputStream outputStream) {
+                final Socket outputSocket, final InputStream inputStream, final OutputStream outputStream, final Direction direction) {
             super();
             this.clientThread = clientThread;
             this.protocol = protocol;
@@ -330,6 +392,7 @@ public class JavaForwarder {
             this.outputDatagramSocket = null;
             this.inputStream = inputStream;
             this.outputStream = outputStream;
+            this.direction = direction;
         }
 
         /**
@@ -352,6 +415,7 @@ public class JavaForwarder {
             this.outputDatagramSocket = outputDatagramSocket;
             this.inputStream = null;
             this.outputStream = null;
+            this.direction = null;
         }
 
         /**
@@ -366,7 +430,9 @@ public class JavaForwarder {
                         outputSocket);
                 try {
                     while (!JavaForwarder.doExit) {
+                        System.out.println("JavaForwarder: " + direction + " waiting for data...");
                         int bytesRead = inputStream.read(buffer);
+                        System.out.println("JavaForwarder: " + direction + " read " + bytesRead + " bytes");
                         // Record data read
                         if (localDateTimeForward == null) {
                             localDateTimeForward = LocalDateTime.now();
@@ -374,6 +440,7 @@ public class JavaForwarder {
                         dataDumpManager.record(localDateTimeForward, buffer, bytesRead);
                         // If end of stream is reached --> exit
                         if (bytesRead == -1) {
+                            System.out.println("JavaForwarder: " + direction + " EOF detected, exiting");
                             break;
                         }
                         if (bytesRead < BUFFER_SIZE) {
@@ -388,6 +455,8 @@ public class JavaForwarder {
                 }
                 // Display threads data dump
                 dataDumpManager.logDataDump();
+                // Signal that this direction has finished
+                clientThread.forwardingDirectionComplete(direction);
                 // Notify parent thread that the connection is broken
                 clientThread.connectionBroken();
             } else if (Protocol.UDP == protocol) {
@@ -421,7 +490,7 @@ public class JavaForwarder {
      */
     private static class DataDumpManager {
 
-        /** Map of timestamps and formatted bytes forwarded from {@code inputSocket} to {@code outputSocket}. */
+        /** Map (shared between threads) of chronological timestamps and formatted traffic between {@code inputSocket} and {@code outputSocket}. */
         private static Map<Long, StringBuffer> mapTimestampDataDump = new TreeMap<Long, StringBuffer>();
 
         /** ID of thread executing {@link ForwardThread} instance. */
@@ -491,7 +560,7 @@ public class JavaForwarder {
                     mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
                 }
             }
-            // Dump data in hex and ascii in DUMP_WIDTH bytes blocks
+            // Dump data in Hex and Ascii in DUMP_WIDTH bytes blocks
             for (int bufferOffset = 0; bufferOffset < bytesRead; bufferOffset++) {
                 byte dataByte = buffer[bufferOffset];
                 if (bytesOffset == 0) {
@@ -578,7 +647,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.11 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.13 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
