@@ -500,18 +500,33 @@ public class JavaForwarder {
                         System.out.println("JavaForwarder: " + direction + " waiting for data...");
                         int bytesRead = inputStream.read(buffer);
                         System.out.println("JavaForwarder: " + direction + " read " + bytesRead + " bytes");
-                        // Record data read
-                        if (localDateTimeForward == null) {
-                            localDateTimeForward = LocalDateTime.now();
-                        }
-                        dataDumpManager.record(localDateTimeForward, buffer, bytesRead);
                         // If end of stream is reached --> exit
                         if (bytesRead == -1) {
                             System.out.println("JavaForwarder: " + direction + " EOF detected, exiting");
                             break;
                         }
+                        // Record timestamp for data read
+                        if (localDateTimeForward == null) {
+                            localDateTimeForward = LocalDateTime.now();
+                        }
+                        // Detect format on first data received (either direction can trigger this)
+                        if (clientThread.getDetectedFormat() == null) {
+                            clientThread.detectFormat(buffer, bytesRead);
+                        }
+                        // Record data based on detected format and DUMP_HTTP setting
+                        Format format = clientThread.getDetectedFormat();
+                        if (format == Format.HTTP && dumpHttpEnabled) {
+                            dataDumpManager.recordHttp(localDateTimeForward, buffer, bytesRead, direction);
+                        } else {
+                            dataDumpManager.record(localDateTimeForward, buffer, bytesRead);
+                        }
+                        // Reset timestamp when buffer not full (end of logical message)
                         if (bytesRead < BUFFER_SIZE) {
                             localDateTimeForward = null;
+                            // Reset HTTP state for next request/response
+                            if (format == Format.HTTP && dumpHttpEnabled) {
+                                dataDumpManager.resetHttpState();
+                            }
                         }
                         // Forward data
                         outputStream.write(buffer, 0, bytesRead);
@@ -836,7 +851,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.14 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.15 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
