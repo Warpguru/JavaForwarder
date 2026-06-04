@@ -1,5 +1,7 @@
 package at.test.forwarder;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 /**
  * This program is an example from the book "Internet programming with Java" by Svetlin Nakov. It is freeware. For more information:
  * http://www.nakov.com/books/inetjava/
@@ -23,6 +25,8 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.TreeMap;
 import java.util.stream.Stream;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.InflaterInputStream;
 
 /**
  * JavaForwarder is a simple {@code TCP} bridging software that allows a {@code TCP} port on some host to be transparently
@@ -30,10 +34,10 @@ import java.util.stream.Stream;
  * listening {@code TCP} port (source port) and starts a thread (ClientThread) that connects to the destination host and starts
  * forwarding the data between the client socket and destination socket.
  * 
- * Run test Node HTTP server to test with chunked messages (request to http://localhost:3000/ retrieves 1. / and 2. /favicon.ico):
- * <xmp>
- * node -e "require('http').createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/plain'});res.end('Hello World!\n');}).listen(3000)"
- * </xmp>
+ * Run test Node HTTP server to test with chunked messages (request to http://localhost:3000/ retrieves 1. / and 2.
+ * /favicon.ico): <xmp> node -e
+ * "require('http').createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/plain'});res.end('Hello
+ * World!\n');}).listen(3000)" </xmp>
  */
 public class JavaForwarder {
 
@@ -51,7 +55,7 @@ public class JavaForwarder {
         /** Data flowing from server to client. */
         SERVER_TO_CLIENT
     }
-    
+
     /** Detected format of the TCP traffic. */
     private static enum Format {
         /** Any non-HTTP TCP protocol. */
@@ -59,7 +63,7 @@ public class JavaForwarder {
         /** HTTP/1.x protocol detected. */
         HTTP
     }
-    
+
     /** Mode of forwarding operation, {@code TCP} (default) or {@code UDP}. */
     private static final String ENVIRONMENT_VARIABLE_MODE = "MODE";
     /** Set to any value to activate recording of the forwarded data in a formatted data dump. */
@@ -99,7 +103,7 @@ public class JavaForwarder {
         /** Detected format of the TCP traffic, shared between both ForwardThreads. */
         private volatile Format detectedFormat = null;
         /** Lock for thread-safe format detection. */
-        private final Object formatDetectionLock = new Object();        
+        private final Object formatDetectionLock = new Object();
         /** Tracks which forwarding directions are still active (for half-close support). */
         private volatile Map<Direction, Boolean> directionActive = new HashMap<>();
 
@@ -151,7 +155,7 @@ public class JavaForwarder {
         public Format getDetectedFormat() {
             return detectedFormat;
         }
-        
+
         /**
          * Establishes connection to the destination server and starts bidirectional forwarding of data between the client and
          * the server.
@@ -225,10 +229,10 @@ public class JavaForwarder {
 //                      + serverDatagramSocket.getPort() + " started");
             }
         }
-           
+
         /**
-         * Called by ForwardThread when one direction of forwarding completes.
-         * Marks the direction as inactive and handles half-close scenarios.
+         * Called by ForwardThread when one direction of forwarding completes. Marks the direction as inactive and handles
+         * half-close scenarios.
          * 
          * @param direction which direction completed
          */
@@ -246,7 +250,7 @@ public class JavaForwarder {
                     // Ignore - socket may already be closed
                 }
             }
-            
+
             // When client closes (CLIENT_TO_SERVER completes), close the server socket
             // to unblock SERVER_TO_CLIENT thread which is waiting on serverInputStream.read()
             if (direction == Direction.CLIENT_TO_SERVER && serverSocket != null && !serverSocket.isClosed()) {
@@ -261,8 +265,8 @@ public class JavaForwarder {
         }
 
         /**
-         * Detect and set the traffic format based on initial data.
-         * Thread-safe - only the first caller performs detection, subsequent calls return cached result.
+         * Detect and set the traffic format based on initial data. Thread-safe - only the first caller performs detection,
+         * subsequent calls return cached result.
          * 
          * @param buffer the data buffer to analyze
          * @param length number of valid bytes in buffer
@@ -278,25 +282,24 @@ public class JavaForwarder {
                 return detectedFormat;
             }
         }
-        
+
         /**
-         * Called by some of the forwarding threads to indicate that its socket connection is broken.
-         * Only closes sockets when BOTH directions have completed to support HTTP Keep-Alive.
-         * Closing the client and server sockets causes all threads blocked on reading or writing to
-         * these sockets to get an exception and to finish their execution.
+         * Called by some of the forwarding threads to indicate that its socket connection is broken. Only closes sockets when
+         * BOTH directions have completed to support HTTP Keep-Alive. Closing the client and server sockets causes all threads
+         * blocked on reading or writing to these sockets to get an exception and to finish their execution.
          */
         public synchronized void connectionBroken() {
             // Check if any direction is still active
             boolean anyDirectionActive = directionActive.values().stream().anyMatch(active -> active);
-            
+
             if (anyDirectionActive) {
                 System.out.println("JavaForwarder: One direction closed, waiting for other direction");
                 return; // Don't close yet - other direction still active
             }
-            
+
             // Both directions finished - now close everything
             System.out.println("JavaForwarder: Both directions closed, terminating connection");
-            
+
             if (serverSocket != null && !serverSocket.isClosed()) {
                 try {
                     serverSocket.close();
@@ -329,13 +332,10 @@ public class JavaForwarder {
                 }
                 if (Protocol.UDP == protocol) {
                     if (clientDatagramSocket.getInetAddress() != null) {
-                    System.out.println("JavaForwarder " + protocol + " connection: "
-                            + clientDatagramSocket.getInetAddress().getHostAddress() 
-                            + ":" 
-                            + clientDatagramSocket.getPort()
-                            + " <--> " 
-                            + serverDatagramSocket.getInetAddress().getHostAddress() + ":"
-                            + serverDatagramSocket.getPort() + " stopped");
+                        System.out.println("JavaForwarder " + protocol + " connection: "
+                                + clientDatagramSocket.getInetAddress().getHostAddress() + ":" + clientDatagramSocket.getPort()
+                                + " <--> " + serverDatagramSocket.getInetAddress().getHostAddress() + ":"
+                                + serverDatagramSocket.getPort() + " stopped");
                     }
                 }
                 forwardingActive = false;
@@ -350,14 +350,13 @@ public class JavaForwarder {
          * @return true if HTTP traffic detected
          */
         private boolean isHttpTraffic(byte[] buffer, int length) {
-            if (length < 4) return false;
+            if (length < 4)
+                return false;
             String prefix = new String(buffer, 0, Math.min(length, 16), java.nio.charset.StandardCharsets.US_ASCII);
             // HTTP request methods
-            if (prefix.startsWith("GET ") || prefix.startsWith("POST ") || 
-                prefix.startsWith("PUT ") || prefix.startsWith("DELETE ") ||
-                prefix.startsWith("PATCH ") || prefix.startsWith("HEAD ") ||
-                prefix.startsWith("OPTIONS ") || prefix.startsWith("CONNECT ") ||
-                prefix.startsWith("TRACE ")) {
+            if (prefix.startsWith("GET ") || prefix.startsWith("POST ") || prefix.startsWith("PUT ")
+                    || prefix.startsWith("DELETE ") || prefix.startsWith("PATCH ") || prefix.startsWith("HEAD ")
+                    || prefix.startsWith("OPTIONS ") || prefix.startsWith("CONNECT ") || prefix.startsWith("TRACE ")) {
                 return true;
             }
             // HTTP response status line
@@ -365,7 +364,7 @@ public class JavaForwarder {
                 return true;
             }
             return false;
-        }        
+        }
     }
 
     /**
@@ -446,7 +445,8 @@ public class JavaForwarder {
          * @param direction    of data flow (client to server or server to client)
          */
         public ForwardThread(final ClientThread clientThread, final Protocol protocol, final Socket inputSocket,
-                final Socket outputSocket, final InputStream inputStream, final OutputStream outputStream, final Direction direction) {
+                final Socket outputSocket, final InputStream inputStream, final OutputStream outputStream,
+                final Direction direction) {
             super();
             this.clientThread = clientThread;
             this.protocol = protocol;
@@ -493,8 +493,8 @@ public class JavaForwarder {
                 final DataDumpManager dataDumpManager = new DataDumpManager(Thread.currentThread().getId(), inputSocket,
                         outputSocket);
                 // Check if DUMP_HTTP is enabled
-                final boolean dumpHttpEnabled = JavaForwarder.getPropertyOrEnvironmentVariable(
-                        JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
+                final boolean dumpHttpEnabled = JavaForwarder
+                        .getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
                 try {
                     while (!JavaForwarder.doExit) {
                         System.out.println("JavaForwarder: " + direction + " waiting for data...");
@@ -551,7 +551,8 @@ public class JavaForwarder {
                             if (localDateTimeForward == null) {
                                 localDateTimeForward = LocalDateTime.now();
                             }
-                            String clientMessage = new String(inputDatagramPacket.getData(), 0, inputDatagramPacket.getLength());
+                            String clientMessage = new String(inputDatagramPacket.getData(), 0,
+                                    inputDatagramPacket.getLength());
                             System.out.println(clientMessage);
                         } catch (SocketTimeoutException e) {
                             // Ignore timeout and continue waiting until we should exist
@@ -572,7 +573,10 @@ public class JavaForwarder {
      */
     private static class DataDumpManager {
 
-        /** Map (shared between threads) of chronological timestamps and formatted traffic between {@code inputSocket} and {@code outputSocket}. */
+        /**
+         * Map (shared between threads) of chronological timestamps and formatted traffic between {@code inputSocket} and
+         * {@code outputSocket}.
+         */
         private static Map<Long, StringBuffer> mapTimestampDataDump = new TreeMap<Long, StringBuffer>();
 
         /** ID of thread executing {@link ForwardThread} instance. */
@@ -599,8 +603,12 @@ public class JavaForwarder {
         private StringBuilder httpHeaderBuffer = new StringBuilder();
         /** Buffer to accumulate HTTP body for current request/response. */
         private StringBuilder httpBodyBuffer = new StringBuilder();
+        /** Stored Content-Encoding header value for decompression. */
+        private String httpContentEncoding = null;
+        /** Raw body bytes accumulated for decompression. */
+        private ByteArrayOutputStream httpRawBodyStream = new ByteArrayOutputStream();
         /** Flag indicating if we're currently in headers or body. */
-        private boolean inHttpBody = false;        
+        private boolean inHttpBody = false;
 
         /**
          * {@link DataDumpManager} initialization.
@@ -615,7 +623,8 @@ public class JavaForwarder {
             this.inputSocket = inputSocket;
             this.outputSocket = outputSocket;
             try {
-                Integer dumpWidth = Integer.valueOf(JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIALBE_DUMP_WIDTH));
+                Integer dumpWidth = Integer
+                        .valueOf(JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIALBE_DUMP_WIDTH));
                 DUMP_WIDTH = (dumpWidth / 16) * 16;
             } catch (NumberFormatException e) {
                 // Ignore
@@ -715,82 +724,99 @@ public class JavaForwarder {
         }
 
         /**
-         * Record HTTP traffic in Postman/Bruno-like format.
+         * Record HTTP traffic in Postman/Bruno-like format with DUMP-style headers.
          * 
          * @param localDateTimeForwarding timestamp of forwarding
-         * @param buffer data buffer
-         * @param bytesRead number of bytes read
-         * @param direction CLIENT_TO_SERVER (request) or SERVER_TO_CLIENT (response)
+         * @param buffer                  data buffer
+         * @param bytesRead               number of bytes read
+         * @param direction               CLIENT_TO_SERVER (request) or SERVER_TO_CLIENT (response)
          */
-        public void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, 
-                               final int bytesRead, final Direction direction) {
+        public void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead,
+                final Direction direction) {
             if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) == null) {
                 return;
             }
-            
-            final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault())
-                    .toInstant().toEpochMilli();
+
+            final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault()).toInstant()
+                    .toEpochMilli();
             synchronized (mapTimestampDataDump) {
                 sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
                 if (sbBufferFormatted == null) {
                     sbBufferFormatted = new StringBuffer();
                     mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
-                    
-                    // Print header for new HTTP exchange
-                    sbBufferFormatted.append(System.lineSeparator());
-                    sbBufferFormatted.append("###############################################################################")
+
+                    // Print header in DUMP-style format
+                    sbBufferFormatted
+                            .append(String.format("Thread %06x: %s: %s:%s -> %s:%s [HTTP %s]", threadId,
+                                    localDateTimeForwarding.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
+                                    inputSocket.getInetAddress().getHostAddress(), inputSocket.getPort(),
+                                    outputSocket.getInetAddress().getHostAddress(), outputSocket.getPort(),
+                                    direction == Direction.CLIENT_TO_SERVER ? "REQUEST" : "RESPONSE"))
                             .append(System.lineSeparator());
-                    sbBufferFormatted.append("### ").append(direction == Direction.CLIENT_TO_SERVER ? "REQUEST" : "RESPONSE")
-                            .append(" - Thread ").append(String.format("%06x", threadId))
-                            .append(" - ").append(localDateTimeForwarding.format(
-                                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")))
-                            .append(System.lineSeparator());
-                    sbBufferFormatted.append("### ").append(inputSocket.getInetAddress().getHostAddress())
-                            .append(":").append(inputSocket.getPort())
-                            .append(" -> ").append(outputSocket.getInetAddress().getHostAddress())
-                            .append(":").append(outputSocket.getPort())
-                            .append(System.lineSeparator());
+                    // Separator line
+                    sbBufferFormatted.append("  -------");
+                    for (int i = 0; i < DUMP_WIDTH; i++) {
+                        sbBufferFormatted.append("----");
+                    }
                     sbBufferFormatted.append(System.lineSeparator());
                 }
-                
-                // Convert buffer to string and append
-                String data = new String(buffer, 0, bytesRead, java.nio.charset.StandardCharsets.UTF_8);
-                
+
+                // Convert buffer to string for header parsing
+                String data = new String(buffer, 0, bytesRead, java.nio.charset.StandardCharsets.ISO_8859_1);
+
                 // Simple parsing: look for double CRLF to separate headers from body
                 if (!inHttpBody) {
                     int headerEnd = data.indexOf("\r\n\r\n");
                     if (headerEnd != -1) {
                         // Found end of headers
                         httpHeaderBuffer.append(data.substring(0, headerEnd));
-                        sbBufferFormatted.append(httpHeaderBuffer.toString()).append(System.lineSeparator());
+                        String headers = httpHeaderBuffer.toString();
+
+                        // Extract Content-Encoding for decompression
+                        httpContentEncoding = extractHeader(headers, "Content-Encoding");
+
+                        // Output headers
+                        sbBufferFormatted.append(headers).append(System.lineSeparator());
                         sbBufferFormatted.append(System.lineSeparator());
-                        
+
                         // Start body
                         inHttpBody = true;
-                        String bodyPart = data.substring(headerEnd + 4);
-                        if (!bodyPart.isEmpty()) {
-                            appendBodyWithWidth(bodyPart);
+                        byte[] bodyPart = extractBodyBytes(buffer, bytesRead, headerEnd + 4);
+                        if (bodyPart.length > 0) {
+                            httpRawBodyStream.write(bodyPart, 0, bodyPart.length);
                         }
                         httpHeaderBuffer = new StringBuilder();
                     } else {
                         httpHeaderBuffer.append(data);
                     }
                 } else {
-                    // Already in body, just append
-                    appendBodyWithWidth(data);
+                    // Already in body, accumulate raw bytes
+                    httpRawBodyStream.write(buffer, 0, bytesRead);
                 }
             }
         }
-        
+
         /**
-         * Reset HTTP state for next request/response.
+         * Reset HTTP state for next request/response and output accumulated body.
          */
         public void resetHttpState() {
+            // Output the accumulated body with decompression if needed
+            if (httpRawBodyStream.size() > 0 && sbBufferFormatted != null) {
+                synchronized (mapTimestampDataDump) {
+                    byte[] rawBody = httpRawBodyStream.toByteArray();
+                    byte[] decodedBody = decompressBody(rawBody, httpContentEncoding);
+                    appendBodyWithWidth(decodedBody);
+                    sbBufferFormatted.append(System.lineSeparator());
+                }
+            }
+
             httpHeaderBuffer = new StringBuilder();
             httpBodyBuffer = new StringBuilder();
+            httpRawBodyStream = new ByteArrayOutputStream();
+            httpContentEncoding = null;
             inHttpBody = false;
         }
-        
+
         /**
          * Log the recorded data dump by increasing timestamp.
          */
@@ -805,12 +831,13 @@ public class JavaForwarder {
 
         /**
          * Append body content respecting DUMP_WIDTH for binary content.
+         * 
+         * @param bodyBytes the body bytes (potentially decompressed)
          */
-        private void appendBodyWithWidth(String bodyData) {
-            // For text content, preserve original formatting
-            // For binary, could do hex dump respecting DUMP_WIDTH
-            byte[] bodyBytes = bodyData.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            
+        private void appendBodyWithWidth(byte[] bodyBytes) {
+            if (bodyBytes.length == 0)
+                return;
+
             // Check if printable text
             boolean isText = true;
             for (byte b : bodyBytes) {
@@ -819,13 +846,16 @@ public class JavaForwarder {
                     break;
                 }
             }
-            
+
             if (isText) {
-                sbBufferFormatted.append(bodyData);
+                // Text content: output as-is
+                sbBufferFormatted.append(new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8));
             } else {
-                // Hex dump respecting DUMP_WIDTH
+                // Binary content: hex dump respecting DUMP_WIDTH
+                sbBufferFormatted.append("  [Binary body - hex dump]").append(System.lineSeparator());
                 for (int i = 0; i < bodyBytes.length; i += DUMP_WIDTH) {
                     sbBufferFormatted.append(String.format("  %06X ", i));
+                    // Hex part
                     for (int j = 0; j < DUMP_WIDTH; j++) {
                         if (i + j < bodyBytes.length) {
                             sbBufferFormatted.append(String.format("%02X ", bodyBytes[i + j]));
@@ -833,6 +863,7 @@ public class JavaForwarder {
                             sbBufferFormatted.append("   ");
                         }
                     }
+                    // ASCII part
                     for (int j = 0; j < DUMP_WIDTH && i + j < bodyBytes.length; j++) {
                         char c = (char) bodyBytes[i + j];
                         sbBufferFormatted.append(c >= 32 && c < 127 ? c : '.');
@@ -841,7 +872,79 @@ public class JavaForwarder {
                 }
             }
         }
-        
+
+        /**
+         * Extract a header value from headers string.
+         * 
+         * @param headers    the headers string
+         * @param headerName the header name to find
+         * @return the header value or null if not found
+         */
+        private String extractHeader(String headers, String headerName) {
+            String[] lines = headers.split("\r\n");
+            for (String line : lines) {
+                int colonPos = line.indexOf(':');
+                if (colonPos != -1) {
+                    String name = line.substring(0, colonPos).trim();
+                    if (name.equalsIgnoreCase(headerName)) {
+                        return line.substring(colonPos + 1).trim();
+                    }
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Extract body bytes from buffer after header end.
+         */
+        private byte[] extractBodyBytes(byte[] buffer, int bytesRead, int bodyStart) {
+            int bodyLength = bytesRead - bodyStart;
+            if (bodyLength <= 0)
+                return new byte[0];
+            byte[] bodyBytes = new byte[bodyLength];
+            System.arraycopy(buffer, bodyStart, bodyBytes, 0, bodyLength);
+            return bodyBytes;
+        }
+
+        /**
+         * Decompress body if Content-Encoding indicates compression.
+         * 
+         * @param rawBody         the raw body bytes
+         * @param contentEncoding the Content-Encoding header value
+         * @return decompressed bytes, or original if not compressed or on error
+         */
+        private byte[] decompressBody(byte[] rawBody, String contentEncoding) {
+            if (contentEncoding == null || rawBody.length == 0) {
+                return rawBody;
+            }
+
+            try {
+                if ("gzip".equalsIgnoreCase(contentEncoding)) {
+                    return readAllBytes(new GZIPInputStream(new ByteArrayInputStream(rawBody)));
+                } else if ("deflate".equalsIgnoreCase(contentEncoding)) {
+                    return readAllBytes(new InflaterInputStream(new ByteArrayInputStream(rawBody)));
+                }
+            } catch (IOException e) {
+                // Decompression failed, return original with error note
+                System.err.println("JavaForwarder: Decompression failed (" + contentEncoding + "): " + e.getMessage());
+            }
+            return rawBody;
+        }
+
+        /**
+         * Read all bytes from an InputStream.
+         */
+        private byte[] readAllBytes(InputStream is) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = is.read(buf)) != -1) {
+                baos.write(buf, 0, r);
+            }
+            is.close();
+            return baos.toByteArray();
+        }
+
     }
 
     /**
@@ -851,7 +954,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.15 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.16 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
@@ -875,7 +978,8 @@ public class JavaForwarder {
             }
             // Check IP we want to forward
             Protocol protocol = Protocol.TCP;
-            if (Protocol.UDP.name().equalsIgnoreCase(JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_MODE))) {
+            if (Protocol.UDP.name().equalsIgnoreCase(
+                    JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_MODE))) {
                 protocol = Protocol.UDP;
             }
             // Printing a start-up message
@@ -988,5 +1092,5 @@ public class JavaForwarder {
         }
         return value;
     }
-    
+
 }
