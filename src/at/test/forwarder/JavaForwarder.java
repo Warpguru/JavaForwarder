@@ -15,6 +15,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -609,7 +610,11 @@ public class JavaForwarder {
         private ByteArrayOutputStream httpRawBodyStream = new ByteArrayOutputStream();
         /** Flag indicating if we're currently in headers or body. */
         private boolean inHttpBody = false;
-
+        /** Flag indicating if HTTP uses chunked transfer encoding. */
+        private boolean isChunkedEncoding = false;
+        /** Complete raw byte stream (headers + body) for hex dump output in DUMP_HTTP mode. */
+        private ByteArrayOutputStream httpRawFullStream = new ByteArrayOutputStream();
+        
         /**
          * {@link DataDumpManager} initialization.
          * 
@@ -740,12 +745,13 @@ public class JavaForwarder {
             final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault()).toInstant()
                     .toEpochMilli();
             synchronized (mapTimestampDataDump) {
+                httpRawFullStream.write(buffer, 0, bytesRead);
+                
                 sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
                 if (sbBufferFormatted == null) {
                     sbBufferFormatted = new StringBuffer();
                     mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
 
-                    // Print header in DUMP-style format
                     sbBufferFormatted
                             .append(String.format("Thread %06x: %s: %s:%s -> %s:%s [HTTP %s]", threadId,
                                     localDateTimeForwarding.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
@@ -753,7 +759,14 @@ public class JavaForwarder {
                                     outputSocket.getInetAddress().getHostAddress(), outputSocket.getPort(),
                                     direction == Direction.CLIENT_TO_SERVER ? "REQUEST" : "RESPONSE"))
                             .append(System.lineSeparator());
-                    // Separator line
+                    sbBufferFormatted.append("  Offset ");
+                    for (int i = 0; i < DUMP_WIDTH; i++) {
+                        sbBufferFormatted.append(String.format("%02X ", i));
+                    }
+                    for (int i = 0; i < DUMP_WIDTH; i++) {
+                        sbBufferFormatted.append(String.format("%1X", (i & 0xF)));
+                    }
+                    sbBufferFormatted.append(System.lineSeparator());
                     sbBufferFormatted.append("  -------");
                     for (int i = 0; i < DUMP_WIDTH; i++) {
                         sbBufferFormatted.append("----");
@@ -761,59 +774,77 @@ public class JavaForwarder {
                     sbBufferFormatted.append(System.lineSeparator());
                 }
 
-                // Convert buffer to string for header parsing
                 String data = new String(buffer, 0, bytesRead, java.nio.charset.StandardCharsets.ISO_8859_1);
 
-                // Simple parsing: look for double CRLF to separate headers from body
                 if (!inHttpBody) {
                     int headerEnd = data.indexOf("\r\n\r\n");
                     if (headerEnd != -1) {
-                        // Found end of headers
                         httpHeaderBuffer.append(data.substring(0, headerEnd));
                         String headers = httpHeaderBuffer.toString();
 
-                        // Extract Content-Encoding for decompression
                         httpContentEncoding = extractHeader(headers, "Content-Encoding");
+                        String transferEncoding = extractHeader(headers, "Transfer-Encoding");
+                        isChunkedEncoding = "chunked".equalsIgnoreCase(transferEncoding);
 
-                        // Output headers
-                        sbBufferFormatted.append(headers).append(System.lineSeparator());
-                        sbBufferFormatted.append(System.lineSeparator());
-
-                        // Start body
                         inHttpBody = true;
                         byte[] bodyPart = extractBodyBytes(buffer, bytesRead, headerEnd + 4);
                         if (bodyPart.length > 0) {
                             httpRawBodyStream.write(bodyPart, 0, bodyPart.length);
                         }
                         httpHeaderBuffer = new StringBuilder();
+                        httpHeaderBuffer.append(headers);
                     } else {
                         httpHeaderBuffer.append(data);
                     }
                 } else {
-                    // Already in body, accumulate raw bytes
                     httpRawBodyStream.write(buffer, 0, bytesRead);
                 }
             }
         }
 
         /**
-         * Reset HTTP state for next request/response and output accumulated body.
+         * Reset HTTP state for next request/response and output accumulated body (with decompression if needed).
          */
         public void resetHttpState() {
-            // Output the accumulated body with decompression if needed
-            if (httpRawBodyStream.size() > 0 && sbBufferFormatted != null) {
+            if (httpRawFullStream.size() > 0 && sbBufferFormatted != null) {
                 synchronized (mapTimestampDataDump) {
-                    byte[] rawBody = httpRawBodyStream.toByteArray();
-                    byte[] decodedBody = decompressBody(rawBody, httpContentEncoding);
-                    appendBodyWithWidth(decodedBody);
+                    byte[] allRawBytes = httpRawFullStream.toByteArray();
+                    
+                    appendRawHexDump(allRawBytes);
+                    
+                    sbBufferFormatted.append("  -------");
+                    for (int i = 0; i < DUMP_WIDTH; i++) {
+                        sbBufferFormatted.append("----");
+                    }
                     sbBufferFormatted.append(System.lineSeparator());
+                    
+                    String headers = httpHeaderBuffer.toString();
+                    if (!headers.isEmpty()) {
+                        String[] headerLines = headers.split("\r\n");
+                        for (String line : headerLines) {
+                            sbBufferFormatted.append("  ").append(line).append(System.lineSeparator());
+                        }
+                        
+                        sbBufferFormatted.append("  -------");
+                        for (int i = 0; i < DUMP_WIDTH; i++) {
+                            sbBufferFormatted.append("----");
+                        }
+                        sbBufferFormatted.append(System.lineSeparator());
+                    }
+                    
+                    byte[] rawBody = httpRawBodyStream.toByteArray();
+                    byte[] cleanBody = isChunkedEncoding ? removeChunkEncoding(rawBody) : rawBody;
+                    byte[] decodedBody = decompressBody(cleanBody, httpContentEncoding);
+                    appendIndentedBodyWithWidth(decodedBody);
                 }
             }
 
+            httpRawFullStream = new ByteArrayOutputStream();
             httpHeaderBuffer = new StringBuilder();
             httpBodyBuffer = new StringBuilder();
             httpRawBodyStream = new ByteArrayOutputStream();
             httpContentEncoding = null;
+            isChunkedEncoding = false;
             inHttpBody = false;
         }
 
@@ -945,6 +976,131 @@ public class JavaForwarder {
             return baos.toByteArray();
         }
 
+        private byte[] removeChunkEncoding(byte[] chunkedBody) {
+            ByteArrayOutputStream clean = new ByteArrayOutputStream();
+            int pos = 0;
+            while (pos < chunkedBody.length) {
+                // Find chunk size line (ends with \r\n)
+                int crlfPos = findCRLF(chunkedBody, pos);
+                if (crlfPos == -1) break;
+                
+                String sizeLine = new String(chunkedBody, pos, crlfPos - pos, StandardCharsets.US_ASCII);
+                int chunkSize = Integer.parseInt(sizeLine.trim().split(";")[0], 16);
+                
+                if (chunkSize == 0) break; // Last chunk
+                
+                pos = crlfPos + 2; // Skip \r\n
+                clean.write(chunkedBody, pos, chunkSize);
+                pos += chunkSize + 2; // Skip chunk data + trailing \r\n
+            }
+            return clean.toByteArray();
+        }
+
+        /**
+         * Append raw hex dump of bytes to sbBufferFormatted.
+         * Does NOT print thread header (assumed already printed by caller).
+         * 
+         * @param rawBytes the complete byte array to dump
+         */
+        private void appendRawHexDump(byte[] rawBytes) {
+            int localBytesIndex = 0;
+            int localBytesOffset = 0;
+            StringBuffer localDataHex = new StringBuffer();
+            StringBuffer localDataChar = new StringBuffer();
+            
+            for (int bufferOffset = 0; bufferOffset < rawBytes.length; bufferOffset++) {
+                byte dataByte = rawBytes[bufferOffset];
+                
+                if (localBytesIndex == 0) {
+                    localDataHex.append(String.format("  %06X ", localBytesOffset));
+                }
+                
+                localDataHex.append(String.format("%02X ", dataByte));
+                Character dataByteChar = new Character((char) dataByte);
+                int type = Character.getType(dataByteChar);
+                if ((Character.CONTROL == type) || (Character.FORMAT == type) || (Character.PRIVATE_USE == type)
+                        || (Character.SURROGATE == type) || (Character.UNASSIGNED == type)) {
+                    localDataChar.append(" ");
+                } else {
+                    localDataChar.append(dataByteChar);
+                }
+                
+                localBytesOffset++;
+                localBytesIndex++;
+                
+                if (localBytesIndex >= DUMP_WIDTH) {
+                    sbBufferFormatted.append(localDataHex).append(localDataChar).append(System.lineSeparator());
+                    localDataHex = new StringBuffer();
+                    localDataChar = new StringBuffer();
+                    localBytesIndex = 0;
+                }
+            }
+            
+            if (localBytesIndex > 0) {
+                for (int bytesIndexNoData = localBytesIndex; bytesIndexNoData < DUMP_WIDTH; bytesIndexNoData++) {
+                    localDataHex.append("   ");
+                }
+                sbBufferFormatted.append(localDataHex).append(localDataChar).append(System.lineSeparator());
+            }
+        }
+        
+        /**
+         * Append body content with 2-space indent, respecting DUMP_WIDTH for binary content.
+         * 
+         * @param bodyBytes the body bytes (potentially decompressed and de-chunked)
+         */
+        private void appendIndentedBodyWithWidth(byte[] bodyBytes) {
+            if (bodyBytes.length == 0) return;
+
+            boolean isText = true;
+            for (byte b : bodyBytes) {
+                if (b < 32 && b != '\r' && b != '\n' && b != '\t') {
+                    isText = false;
+                    break;
+                }
+            }
+
+            if (isText) {
+                String bodyText = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+                String[] lines = bodyText.split("\n", -1);
+                for (int i = 0; i < lines.length; i++) {
+                    if (i == lines.length - 1 && lines[i].isEmpty()) {
+                        break;
+                    }
+                    sbBufferFormatted.append("  ").append(lines[i]);
+                    if (i < lines.length - 1) {
+                        sbBufferFormatted.append(System.lineSeparator());
+                    }
+                }
+            } else {
+                sbBufferFormatted.append("  [Binary body - hex dump]").append(System.lineSeparator());
+                for (int i = 0; i < bodyBytes.length; i += DUMP_WIDTH) {
+                    sbBufferFormatted.append("    ").append(String.format("%06X ", i));
+                    for (int j = 0; j < DUMP_WIDTH; j++) {
+                        if (i + j < bodyBytes.length) {
+                            sbBufferFormatted.append(String.format("%02X ", bodyBytes[i + j]));
+                        } else {
+                            sbBufferFormatted.append("   ");
+                        }
+                    }
+                    for (int j = 0; j < DUMP_WIDTH && i + j < bodyBytes.length; j++) {
+                        char c = (char) bodyBytes[i + j];
+                        sbBufferFormatted.append(c >= 32 && c < 127 ? c : '.');
+                    }
+                    if (i + DUMP_WIDTH < bodyBytes.length) {
+                        sbBufferFormatted.append(System.lineSeparator());
+                    }
+                }
+            }
+        }
+        
+        private int findCRLF(byte[] data, int start) {
+            for (int i = start; i < data.length - 1; i++) {
+                if (data[i] == '\r' && data[i+1] == '\n') return i;
+            }
+            return -1;
+        }
+        
     }
 
     /**
@@ -954,7 +1110,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.16 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.17 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
