@@ -50,7 +50,15 @@ public class JavaForwarder {
         CLIENT_TO_SERVER,
         /** Data flowing from server to client. */
         SERVER_TO_CLIENT
-    }    
+    }
+    
+    /** Detected format of the TCP traffic. */
+    private static enum Format {
+        /** Any non-HTTP TCP protocol. */
+        OTHER,
+        /** HTTP/1.x protocol detected. */
+        HTTP
+    }
     
     /** Mode of forwarding operation, {@code TCP} (default) or {@code UDP}. */
     private static final String ENVIRONMENT_VARIABLE_MODE = "MODE";
@@ -88,6 +96,10 @@ public class JavaForwarder {
         private DatagramSocket serverDatagramSocket;
         /** Flag set while forwarding is active. */
         private boolean forwardingActive = false;
+        /** Detected format of the TCP traffic, shared between both ForwardThreads. */
+        private volatile Format detectedFormat = null;
+        /** Lock for thread-safe format detection. */
+        private final Object formatDetectionLock = new Object();        
         /** Tracks which forwarding directions are still active (for half-close support). */
         private volatile Map<Direction, Boolean> directionActive = new HashMap<>();
 
@@ -131,6 +143,15 @@ public class JavaForwarder {
             directionActive.put(Direction.SERVER_TO_CLIENT, true);
         }
 
+        /**
+         * Get the detected traffic format.
+         * 
+         * @return the detected Format, or null if not yet detected
+         */
+        public Format getDetectedFormat() {
+            return detectedFormat;
+        }
+        
         /**
          * Establishes connection to the destination server and starts bidirectional forwarding of data between the client and
          * the server.
@@ -204,7 +225,7 @@ public class JavaForwarder {
 //                      + serverDatagramSocket.getPort() + " started");
             }
         }
-
+           
         /**
          * Called by ForwardThread when one direction of forwarding completes.
          * Marks the direction as inactive and handles half-close scenarios.
@@ -239,6 +260,25 @@ public class JavaForwarder {
             }
         }
 
+        /**
+         * Detect and set the traffic format based on initial data.
+         * Thread-safe - only the first caller performs detection, subsequent calls return cached result.
+         * 
+         * @param buffer the data buffer to analyze
+         * @param length number of valid bytes in buffer
+         * @return the detected Format (HTTP or OTHER)
+         */
+        public Format detectFormat(byte[] buffer, int length) {
+            synchronized (formatDetectionLock) {
+                if (detectedFormat != null) {
+                    return detectedFormat;
+                }
+                detectedFormat = isHttpTraffic(buffer, length) ? Format.HTTP : Format.OTHER;
+                System.out.println("JavaForwarder: Detected traffic format: " + detectedFormat);
+                return detectedFormat;
+            }
+        }
+        
         /**
          * Called by some of the forwarding threads to indicate that its socket connection is broken.
          * Only closes sockets when BOTH directions have completed to support HTTP Keep-Alive.
@@ -302,6 +342,30 @@ public class JavaForwarder {
             }
         }
 
+        /**
+         * Check if the data appears to be HTTP traffic.
+         * 
+         * @param buffer the data buffer to check
+         * @param length number of valid bytes in buffer
+         * @return true if HTTP traffic detected
+         */
+        private boolean isHttpTraffic(byte[] buffer, int length) {
+            if (length < 4) return false;
+            String prefix = new String(buffer, 0, Math.min(length, 16), java.nio.charset.StandardCharsets.US_ASCII);
+            // HTTP request methods
+            if (prefix.startsWith("GET ") || prefix.startsWith("POST ") || 
+                prefix.startsWith("PUT ") || prefix.startsWith("DELETE ") ||
+                prefix.startsWith("PATCH ") || prefix.startsWith("HEAD ") ||
+                prefix.startsWith("OPTIONS ") || prefix.startsWith("CONNECT ") ||
+                prefix.startsWith("TRACE ")) {
+                return true;
+            }
+            // HTTP response status line
+            if (prefix.startsWith("HTTP/1.0") || prefix.startsWith("HTTP/1.1")) {
+                return true;
+            }
+            return false;
+        }        
     }
 
     /**
@@ -428,6 +492,9 @@ public class JavaForwarder {
             if (Protocol.TCP == protocol) {
                 final DataDumpManager dataDumpManager = new DataDumpManager(Thread.currentThread().getId(), inputSocket,
                         outputSocket);
+                // Check if DUMP_HTTP is enabled
+                final boolean dumpHttpEnabled = JavaForwarder.getPropertyOrEnvironmentVariable(
+                        JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
                 try {
                     while (!JavaForwarder.doExit) {
                         System.out.println("JavaForwarder: " + direction + " waiting for data...");
@@ -513,6 +580,12 @@ public class JavaForwarder {
         private StringBuffer sbDataHex = null;
         /** Buffer to record up to {@code DUMP_WIDTH} bytes of a single record of data dump bytes in {@code ASCII}. */
         private StringBuffer sbDataChar = null;
+        /** Buffer to accumulate HTTP headers for current request/response. */
+        private StringBuilder httpHeaderBuffer = new StringBuilder();
+        /** Buffer to accumulate HTTP body for current request/response. */
+        private StringBuilder httpBodyBuffer = new StringBuilder();
+        /** Flag indicating if we're currently in headers or body. */
+        private boolean inHttpBody = false;        
 
         /**
          * {@link DataDumpManager} initialization.
@@ -627,6 +700,83 @@ public class JavaForwarder {
         }
 
         /**
+         * Record HTTP traffic in Postman/Bruno-like format.
+         * 
+         * @param localDateTimeForwarding timestamp of forwarding
+         * @param buffer data buffer
+         * @param bytesRead number of bytes read
+         * @param direction CLIENT_TO_SERVER (request) or SERVER_TO_CLIENT (response)
+         */
+        public void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, 
+                               final int bytesRead, final Direction direction) {
+            if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) == null) {
+                return;
+            }
+            
+            final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault())
+                    .toInstant().toEpochMilli();
+            synchronized (mapTimestampDataDump) {
+                sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
+                if (sbBufferFormatted == null) {
+                    sbBufferFormatted = new StringBuffer();
+                    mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
+                    
+                    // Print header for new HTTP exchange
+                    sbBufferFormatted.append(System.lineSeparator());
+                    sbBufferFormatted.append("###############################################################################")
+                            .append(System.lineSeparator());
+                    sbBufferFormatted.append("### ").append(direction == Direction.CLIENT_TO_SERVER ? "REQUEST" : "RESPONSE")
+                            .append(" - Thread ").append(String.format("%06x", threadId))
+                            .append(" - ").append(localDateTimeForwarding.format(
+                                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")))
+                            .append(System.lineSeparator());
+                    sbBufferFormatted.append("### ").append(inputSocket.getInetAddress().getHostAddress())
+                            .append(":").append(inputSocket.getPort())
+                            .append(" -> ").append(outputSocket.getInetAddress().getHostAddress())
+                            .append(":").append(outputSocket.getPort())
+                            .append(System.lineSeparator());
+                    sbBufferFormatted.append(System.lineSeparator());
+                }
+                
+                // Convert buffer to string and append
+                String data = new String(buffer, 0, bytesRead, java.nio.charset.StandardCharsets.UTF_8);
+                
+                // Simple parsing: look for double CRLF to separate headers from body
+                if (!inHttpBody) {
+                    int headerEnd = data.indexOf("\r\n\r\n");
+                    if (headerEnd != -1) {
+                        // Found end of headers
+                        httpHeaderBuffer.append(data.substring(0, headerEnd));
+                        sbBufferFormatted.append(httpHeaderBuffer.toString()).append(System.lineSeparator());
+                        sbBufferFormatted.append(System.lineSeparator());
+                        
+                        // Start body
+                        inHttpBody = true;
+                        String bodyPart = data.substring(headerEnd + 4);
+                        if (!bodyPart.isEmpty()) {
+                            appendBodyWithWidth(bodyPart);
+                        }
+                        httpHeaderBuffer = new StringBuilder();
+                    } else {
+                        httpHeaderBuffer.append(data);
+                    }
+                } else {
+                    // Already in body, just append
+                    appendBodyWithWidth(data);
+                }
+            }
+        }
+        
+        /**
+         * Reset HTTP state for next request/response.
+         */
+        public void resetHttpState() {
+            httpHeaderBuffer = new StringBuilder();
+            httpBodyBuffer = new StringBuilder();
+            inHttpBody = false;
+        }
+        
+        /**
          * Log the recorded data dump by increasing timestamp.
          */
         public void logDataDump() {
@@ -638,6 +788,45 @@ public class JavaForwarder {
             }
         }
 
+        /**
+         * Append body content respecting DUMP_WIDTH for binary content.
+         */
+        private void appendBodyWithWidth(String bodyData) {
+            // For text content, preserve original formatting
+            // For binary, could do hex dump respecting DUMP_WIDTH
+            byte[] bodyBytes = bodyData.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            
+            // Check if printable text
+            boolean isText = true;
+            for (byte b : bodyBytes) {
+                if (b < 32 && b != '\r' && b != '\n' && b != '\t') {
+                    isText = false;
+                    break;
+                }
+            }
+            
+            if (isText) {
+                sbBufferFormatted.append(bodyData);
+            } else {
+                // Hex dump respecting DUMP_WIDTH
+                for (int i = 0; i < bodyBytes.length; i += DUMP_WIDTH) {
+                    sbBufferFormatted.append(String.format("  %06X ", i));
+                    for (int j = 0; j < DUMP_WIDTH; j++) {
+                        if (i + j < bodyBytes.length) {
+                            sbBufferFormatted.append(String.format("%02X ", bodyBytes[i + j]));
+                        } else {
+                            sbBufferFormatted.append("   ");
+                        }
+                    }
+                    for (int j = 0; j < DUMP_WIDTH && i + j < bodyBytes.length; j++) {
+                        char c = (char) bodyBytes[i + j];
+                        sbBufferFormatted.append(c >= 32 && c < 127 ? c : '.');
+                    }
+                    sbBufferFormatted.append(System.lineSeparator());
+                }
+            }
+        }
+        
     }
 
     /**
@@ -647,7 +836,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.13 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.14 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
@@ -663,7 +852,8 @@ public class JavaForwarder {
                 System.out.println("");
                 System.out.println("  Supported optional environment variables:");
                 System.out.println("    MODE ... forward TCP (default) or UDP data");
-                System.out.println("    DUMP ... any value to record data forwarded a formatted data dump");
+                System.out.println("    DUMP ... any value to record data forwarded as formatted data dump");
+                System.out.println("    DUMP_HTTP ... any value to record data forwarded as formatted HTTP dump");
                 System.out.println("    DUMP_WIDTH ... multiple of 16 defining number of bytes per row of formatted data dump");
                 System.out.println("");
                 return;
