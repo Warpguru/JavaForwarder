@@ -12,8 +12,10 @@ JavaForwarder is a TCP reverse proxy that transparently forwards traffic between
 4. [Connection Lifecycle](#connection-lifecycle)
 5. [Half-Close Socket Handling](#half-close-socket-handling)
 6. [Data Flow and Chunking](#data-flow-and-chunking)
-7. [Data Dump Management](#data-dump-management)
-8. [Configuration](#configuration)
+7. [HTTP Format Detection](#http-format-detection)
+8. [Data Dump Management](#data-dump-management)
+9. [HTTP Dump Management (DUMP_HTTP)](#http-dump-management-dump_http)
+10. [Configuration](#configuration)
 
 ---
 
@@ -75,6 +77,12 @@ classDiagram
         SERVER_TO_CLIENT
     }
     
+    class Format {
+        <<enumeration>>
+        OTHER
+        HTTP
+    }
+    
     class ClientThread {
         -Protocol protocol
         -Socket clientSocket
@@ -82,10 +90,15 @@ classDiagram
         -String remoteHost
         -int remotePort
         -boolean forwardingActive
+        -volatile Format detectedFormat
+        -Object formatDetectionLock
         -Map~Direction,Boolean~ directionActive
         +void run()
+        +Format detectFormat(byte[], int)
+        +Format getDetectedFormat()
         +synchronized void forwardingDirectionComplete(Direction)
         +synchronized void connectionBroken()
+        -boolean isHttpTraffic(byte[], int)
     }
     
     class ForwardThread {
@@ -106,8 +119,24 @@ classDiagram
         -Socket inputSocket
         -Socket outputSocket
         -int DUMP_WIDTH
+        -StringBuilder httpHeaderBuffer
+        -String httpContentEncoding
+        -ByteArrayOutputStream httpRawBodyStream
+        -ByteArrayOutputStream httpRawFullStream
+        -boolean inHttpBody
+        -boolean isChunkedEncoding
         +void record(LocalDateTime, byte[], int)
+        +void recordHttp(LocalDateTime, byte[], int, Direction)
+        +void resetHttpState()
         +void logDataDump()
+        -void appendRawHexDump(byte[])
+        -void appendIndentedBodyWithWidth(byte[])
+        -String extractHeader(String, String)
+        -byte[] extractBodyBytes(byte[], int, int)
+        -byte[] decompressBody(byte[], String)
+        -byte[] removeChunkEncoding(byte[])
+        -int findCRLF(byte[], int)
+        -byte[] readAllBytes(InputStream)
     }
     
     class ProxyThread {
@@ -373,6 +402,87 @@ graph TD
 
 ---
 
+## HTTP Format Detection
+
+When `DUMP_HTTP` is enabled, JavaForwarder automatically detects HTTP traffic and provides enhanced logging. The detection is performed on the first data chunk received and shared between both forwarding threads.
+
+### Format Enum
+
+The `Format` enumeration defines the detected traffic types:
+
+| Value | Description |
+|-------|-------------|
+| `OTHER` | Non-HTTP TCP traffic (raw hex dump only) |
+| `HTTP` | HTTP/1.x traffic detected (enhanced parsing available) |
+
+### Detection Logic
+
+```mermaid
+flowchart TD
+    A[First data chunk received] --> B[detectFormat called]
+    B --> C{detectedFormat<br/>already set?}
+    C -->|Yes| D[Return cached format]
+    C -->|No| E[synchronized<br/>formatDetectionLock]
+    E --> F{isHttpTraffic?}
+    F -->|Yes| G[detectedFormat = HTTP]
+    F -->|No| H[detectedFormat = OTHER]
+    G --> I[Log: Detected format HTTP]
+    H --> J[Log: Detected format OTHER]
+    I --> K[Return format]
+    J --> K
+```
+
+### HTTP Detection Rules
+
+The `isHttpTraffic()` method checks the first 16 bytes of data for HTTP signatures:
+
+**Request Methods:**
+- `GET `, `POST `, `PUT `, `DELETE `, `PATCH `
+- `HEAD `, `OPTIONS `, `CONNECT `, `TRACE `
+
+**Response Status Line:**
+- `HTTP/1.0`, `HTTP/1.1`
+
+```mermaid
+graph TD
+    A[Check first 16 bytes] --> B{Starts with<br/>HTTP method?}
+    B -->|Yes| C[Return true - HTTP Request]
+    B -->|No| D{Starts with<br/>HTTP/1.x?}
+    D -->|Yes| E[Return true - HTTP Response]
+    D -->|No| F[Return false - Not HTTP]
+```
+
+### Thread-Safe Detection
+
+Both `CLIENT_TO_SERVER` and `SERVER_TO_CLIENT` threads share the same `detectedFormat` field. Thread safety is ensured via:
+
+1. **`volatile` modifier** on `detectedFormat` - ensures visibility across threads
+2. **`formatDetectionLock`** - synchronized block ensures only first caller performs detection
+
+```mermaid
+sequenceDiagram
+    participant C2S as CLIENT_TO_SERVER
+    participant CT as ClientThread
+    participant S2C as SERVER_TO_CLIENT
+
+    Note over CT: detectedFormat = null
+
+    C2S->>CT: detectFormat(buffer)
+    Note over CT: Acquire formatDetectionLock
+    CT->>CT: isHttpTraffic() → true
+    CT->>CT: detectedFormat = HTTP
+    Note over CT: Release lock
+    CT-->>C2S: Return HTTP
+
+    S2C->>CT: detectFormat(buffer)
+    Note over CT: Acquire formatDetectionLock
+    Note over CT: detectedFormat already set
+    Note over CT: Release lock
+    CT-->>S2C: Return HTTP (cached)
+```
+
+---
+
 ## Data Dump Management
 
 ### Static Shared Map
@@ -433,6 +543,132 @@ Thread 00000d: 2026-06-03 18:20:30.409: 127.0.0.1:54247 -> 127.0.0.1:3000
 
 ---
 
+## HTTP Dump Management (DUMP_HTTP)
+
+When `DUMP_HTTP` is enabled and HTTP traffic is detected, JavaForwarder provides enhanced HTTP-aware logging that displays both raw hex dump and parsed HTTP content.
+
+### DUMP_HTTP vs DUMP
+
+| Feature | DUMP | DUMP_HTTP |
+|---------|------|-----------|
+| Raw hex dump | ✅ | ✅ |
+| Parsed HTTP headers | ❌ | ✅ (indented) |
+| Decoded body | ❌ | ✅ (decompressed, de-chunked) |
+| Chunked encoding handling | Raw display | Clean body without chunk markers |
+| Compression handling | Raw compressed bytes | Decompressed content |
+| Format detection | None | Automatic HTTP detection |
+
+### Output Format
+
+DUMP_HTTP produces a structured output with both raw and parsed sections:
+
+```
+Thread 00000d: 2026-06-04 18:52:38.730: 127.0.0.1:54011 -> 127.0.0.1:3000 [HTTP REQUEST]
+  Offset 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 0123456789ABCDEF
+  -----------------------------------------------------------------------
+  000000 47 45 54 20 2F 66 61 76 69 63 6F 6E 2E 69 63 6F GET /favicon.ico
+  000010 20 48 54 54 50 2F 31 2E 31 0D 0A 48 6F 73 74 3A  HTTP/1.1  Host:
+  ...
+  -----------------------------------------------------------------------
+  GET /favicon.ico HTTP/1.1
+  Host: localhost
+  User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+  Accept: image/avif,image/webp,image/png
+  Accept-Encoding: gzip, deflate, br, zstd
+  Connection: keep-alive
+  -----------------------------------------------------------------------
+  (decoded body content here)
+```
+
+### Data Flow in DUMP_HTTP Mode
+
+```mermaid
+flowchart TD
+    A[ForwardThread receives data] --> B{DUMP_HTTP enabled<br/>AND Format == HTTP?}
+    B -->|Yes| C[recordHttp]
+    B -->|No| D[record - standard hex dump]
+    
+    C --> E[Capture raw bytes<br/>in httpRawFullStream]
+    E --> F{In headers<br/>or body?}
+    F -->|Headers| G[Parse header lines<br/>Detect Content-Encoding<br/>Detect Transfer-Encoding]
+    F -->|Body| H[Accumulate body bytes<br/>in httpRawBodyStream]
+    G --> I{Found CRLFCRLF?}
+    I -->|Yes| J[Switch to body mode]
+    I -->|No| K[Continue accumulating]
+    
+    H --> L{bytesRead < BUFFER_SIZE?}
+    L -->|Yes| M[resetHttpState - output all]
+    L -->|No| N[Continue accumulating]
+```
+
+### resetHttpState() Processing
+
+When message is complete, `resetHttpState()` outputs everything:
+
+```mermaid
+flowchart TD
+    A[resetHttpState called] --> B[Get all raw bytes]
+    B --> C[Output raw hex dump<br/>appendRawHexDump]
+    C --> D[Output separator line]
+    D --> E[Output parsed headers<br/>with 2-space indent]
+    E --> F[Output separator line]
+    F --> G{Chunked encoding?}
+    G -->|Yes| H[removeChunkEncoding]
+    G -->|No| I[Use raw body]
+    H --> J{Compressed?}
+    I --> J
+    J -->|gzip| K[GZIP decompress]
+    J -->|deflate| L[Deflate decompress]
+    J -->|No| M[Use as-is]
+    K --> N[Output body with indent<br/>appendIndentedBodyWithWidth]
+    L --> N
+    M --> N
+    N --> O[Reset all HTTP state]
+```
+
+### Chunked Transfer Encoding
+
+HTTP chunked encoding wraps body content with chunk size metadata. DUMP_HTTP removes this for clean display:
+
+**Wire Format (raw):**
+```
+d\r\n              ← chunk size in hex (13 bytes)
+Hello World!\n    ← actual data (13 bytes)
+\r\n              ← chunk end
+0\r\n             ← last chunk (size 0)
+\r\n              ← final CRLF
+```
+
+**DUMP_HTTP Output (decoded):**
+```
+Hello World!
+```
+
+### Compression Handling
+
+DUMP_HTTP automatically decompresses bodies based on `Content-Encoding` header:
+
+| Content-Encoding | Decompression Method |
+|-----------------|---------------------|
+| `gzip` | `GZIPInputStream` |
+| `deflate` | `InflaterInputStream` |
+| (none/other) | No decompression |
+
+If decompression fails (corrupt data), the raw bytes are displayed with an error message.
+
+### HTTP State Fields
+
+| Field | Purpose |
+|-------|---------|
+| `httpHeaderBuffer` | Accumulates header lines until CRLFCRLF found |
+| `httpRawBodyStream` | Accumulates raw body bytes (for decompression) |
+| `httpRawFullStream` | Accumulates ALL raw bytes (for hex dump) |
+| `httpContentEncoding` | Extracted from headers for decompression |
+| `isChunkedEncoding` | Extracted from Transfer-Encoding header |
+| `inHttpBody` | State flag: parsing headers vs body |
+
+---
+
 ## Configuration
 
 ### Environment Variables
@@ -440,9 +676,9 @@ Thread 00000d: 2026-06-03 18:20:30.409: 127.0.0.1:54247 -> 127.0.0.1:3000
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MODE` | Protocol: `TCP` or `UDP` | `TCP` |
-| `DUMP` | Enable traffic logging (any value) | disabled |
+| `DUMP` | Enable raw hex traffic logging (any value) | disabled |
 | `DUMP_WIDTH` | Bytes per row in hex dump (multiple of 16) | 16 |
-| `DUMP_HTTP` | HTTP-specific logging (future) | disabled |
+| `DUMP_HTTP` | HTTP-aware logging with parsed headers, decompression, and de-chunking | disabled |
 
 ### Command Line
 
@@ -537,24 +773,23 @@ JavaForwarder TCP connection: 127.0.0.1:54247 <--> 127.0.0.1:3000 stopped
 
 ---
 
-## Future Enhancements
+## Possible Future Enhancements
 
-1. **HTTP-Aware Logging** (`DUMP_HTTP` environment variable)
-   - Parse HTTP headers and body separately
-   - Display in Postman/Bruno-like format
-   - Handle chunked transfer encoding display
-
-2. **UDP Support**
+1. **UDP Support**
    - Currently partially implemented
    - Needs bidirectional forwarding completion
 
-3. **Connection Pooling**
+2. **Connection Pooling**
    - Reuse server connections for multiple client connections
    - Reduce connection overhead
 
-4. **TLS/SSL Support**
+3. **TLS/SSL Support**
    - Intercept HTTPS traffic (with proper certificates)
    - Display decrypted content
+
+4. **HTTP/2 Support**
+   - Binary protocol detection and parsing
+   - Frame-level logging
 
 ---
 

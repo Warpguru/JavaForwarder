@@ -9,6 +9,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.BindException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.ServerSocket;
@@ -237,28 +238,27 @@ public class JavaForwarder {
          * 
          * @param direction which direction completed
          */
-        public synchronized void forwardingDirectionComplete(Direction direction) {
+        public synchronized void forwardingDirectionComplete(final Direction direction) {
             directionActive.put(direction, false);
-            System.out.println("JavaForwarder: " + direction + " forwarding completed");
+            System.out.println("JavaForwarder " + direction + " forwarding completed");
             // When server closes (SERVER_TO_CLIENT completes), close the client socket
             // to unblock CLIENT_TO_SERVER thread which is waiting on clientInputStream.read()
             if (direction == Direction.SERVER_TO_CLIENT && clientSocket != null && !clientSocket.isClosed()) {
                 try {
                     // Close client socket to make CLIENT_TO_SERVER thread exit
                     clientSocket.close();
-                    System.out.println("JavaForwarder: Closed client socket to unblock CLIENT_TO_SERVER");
+                    System.out.println("JavaForwarder closed client socket to unblock CLIENT_TO_SERVER");
                 } catch (Exception e) {
                     // Ignore - socket may already be closed
                 }
             }
-
             // When client closes (CLIENT_TO_SERVER completes), close the server socket
             // to unblock SERVER_TO_CLIENT thread which is waiting on serverInputStream.read()
             if (direction == Direction.CLIENT_TO_SERVER && serverSocket != null && !serverSocket.isClosed()) {
                 try {
                     // Close server socket to make SERVER_TO_CLIENT thread exit
                     serverSocket.close();
-                    System.out.println("JavaForwarder: Closed server socket to unblock SERVER_TO_CLIENT");
+                    System.out.println("JavaForwarder closed server socket to unblock SERVER_TO_CLIENT");
                 } catch (Exception e) {
                     // Ignore - socket may already be closed
                 }
@@ -269,17 +269,37 @@ public class JavaForwarder {
          * Detect and set the traffic format based on initial data. Thread-safe - only the first caller performs detection,
          * subsequent calls return cached result.
          * 
+         * <p>
+         * <b>Rationale:</b> Both CLIENT_TO_SERVER and SERVER_TO_CLIENT threads need to know the detected format to choose
+         * between DUMP and DUMP_HTTP output. Detection happens on first data chunk (either direction can see it first), then
+         * result is shared.
+         * </p>
+         * 
+         * <p>
+         * <b>Thread Safety:</b> Uses synchronized(formatDetectionLock) to ensure only one thread performs detection even if
+         * both threads receive data simultaneously. Cached result in volatile field for fast subsequent access.
+         * </p>
+         * 
+         * <p>
+         * <b>Detection Strategy:</b> Checks first bytes for HTTP signatures (GET, POST, HTTP/). See {@link #isHttpTraffic()}
+         * for details.
+         * </p>
+         * 
+         * <p>
+         * <b>Called by:</b> {@link ForwardThread#run()} on first data chunk before recording.
+         * </p>
+         * 
          * @param buffer the data buffer to analyze
          * @param length number of valid bytes in buffer
          * @return the detected Format (HTTP or OTHER)
          */
-        public Format detectFormat(byte[] buffer, int length) {
+        private Format detectFormat(final byte[] buffer, final int length) {
             synchronized (formatDetectionLock) {
                 if (detectedFormat != null) {
                     return detectedFormat;
                 }
                 detectedFormat = isHttpTraffic(buffer, length) ? Format.HTTP : Format.OTHER;
-                System.out.println("JavaForwarder: Detected traffic format: " + detectedFormat);
+                System.out.println("JavaForwarder detected traffic format: " + detectedFormat);
                 return detectedFormat;
             }
         }
@@ -288,19 +308,38 @@ public class JavaForwarder {
          * Called by some of the forwarding threads to indicate that its socket connection is broken. Only closes sockets when
          * BOTH directions have completed to support HTTP Keep-Alive. Closing the client and server sockets causes all threads
          * blocked on reading or writing to these sockets to get an exception and to finish their execution.
+         * 
+         * <p>
+         * <b>Rationale:</b> HTTP/1.1 Keep-Alive allows multiple request/response pairs on a single TCP connection. If we close
+         * sockets immediately when one direction finishes, we'd break legitimate Keep-Alive connections. Must wait for both
+         * directions to complete.
+         * </p>
+         * 
+         * <p>
+         * <b>Design:</b> Uses directionActive map to track CLIENT_TO_SERVER and SERVER_TO_CLIENT states independently. First
+         * direction to finish just marks itself inactive and returns. Second direction to finish sees both inactive and closes
+         * everything.
+         * </p>
+         * 
+         * <p>
+         * <b>Synchronization:</b> Entire method is synchronized to prevent race conditions when both threads finish
+         * simultaneously.
+         * </p>
+         * 
+         * <p>
+         * <b>Socket Cleanup:</b> Closes both client and server sockets to unblock any threads still waiting on read() calls.
+         * Ignores exceptions since sockets may already be closed.
+         * </p>
          */
-        public synchronized void connectionBroken() {
+        private synchronized void connectionBroken() {
             // Check if any direction is still active
             boolean anyDirectionActive = directionActive.values().stream().anyMatch(active -> active);
-
             if (anyDirectionActive) {
-                System.out.println("JavaForwarder: One direction closed, waiting for other direction");
+                System.out.println("JavaForwarder one direction closed, waiting for other direction");
                 return; // Don't close yet - other direction still active
             }
-
             // Both directions finished - now close everything
-            System.out.println("JavaForwarder: Both directions closed, terminating connection");
-
+            System.out.println("JavaForwarder both directions closed, terminating connection");
             if (serverSocket != null && !serverSocket.isClosed()) {
                 try {
                     serverSocket.close();
@@ -346,11 +385,35 @@ public class JavaForwarder {
         /**
          * Check if the data appears to be HTTP traffic.
          * 
+         * <p>
+         * <b>Rationale:</b> Not all TCP traffic is HTTP. We need to detect the protocol to choose appropriate dump format. HTTP
+         * has clear signatures in first bytes: request methods (GET, POST, etc.) or response status line (HTTP/1.x).
+         * </p>
+         * 
+         * <p>
+         * <b>Detection Logic:</b>
+         * <ul>
+         * <li>Checks first 16 bytes (sufficient for method/version detection)</li>
+         * <li>Request: Looks for "GET ", "POST ", "PUT ", etc. (space after method)</li>
+         * <li>Response: Looks for "HTTP/1.0" or "HTTP/1.1" at start</li>
+         * <li>Uses US_ASCII since HTTP start line must be ASCII per RFC</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>Limitations:</b>
+         * <ul>
+         * <li>Doesn't detect HTTP/2 (uses binary protocol)</li>
+         * <li>Could false-positive on binary data starting with these bytes (very rare)</li>
+         * <li>Requires at least 4 bytes to decide</li>
+         * </ul>
+         * </p>
+         * 
          * @param buffer the data buffer to check
          * @param length number of valid bytes in buffer
-         * @return true if HTTP traffic detected
+         * @return true if HTTP traffic detected, false otherwise
          */
-        private boolean isHttpTraffic(byte[] buffer, int length) {
+        private boolean isHttpTraffic(final byte[] buffer, final int length) {
             if (length < 4)
                 return false;
             String prefix = new String(buffer, 0, Math.min(length, 16), java.nio.charset.StandardCharsets.US_ASCII);
@@ -498,12 +561,12 @@ public class JavaForwarder {
                         .getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
                 try {
                     while (!JavaForwarder.doExit) {
-                        System.out.println("JavaForwarder: " + direction + " waiting for data...");
+                        System.out.println("JavaForwarderd " + direction + " waiting for data...");
                         int bytesRead = inputStream.read(buffer);
-                        System.out.println("JavaForwarder: " + direction + " read " + bytesRead + " bytes");
+                        System.out.println("JavaForwarder " + direction + " read " + bytesRead + " bytes");
                         // If end of stream is reached --> exit
                         if (bytesRead == -1) {
-                            System.out.println("JavaForwarder: " + direction + " EOF detected, exiting");
+                            System.out.println("JavaForwarder " + direction + " EOF detected, exiting");
                             break;
                         }
                         // Record timestamp for data read
@@ -602,8 +665,6 @@ public class JavaForwarder {
         private StringBuffer sbDataChar = null;
         /** Buffer to accumulate HTTP headers for current request/response. */
         private StringBuilder httpHeaderBuffer = new StringBuilder();
-        /** Buffer to accumulate HTTP body for current request/response. */
-        private StringBuilder httpBodyBuffer = new StringBuilder();
         /** Stored Content-Encoding header value for decompression. */
         private String httpContentEncoding = null;
         /** Raw body bytes accumulated for decompression. */
@@ -614,7 +675,7 @@ public class JavaForwarder {
         private boolean isChunkedEncoding = false;
         /** Complete raw byte stream (headers + body) for hex dump output in DUMP_HTTP mode. */
         private ByteArrayOutputStream httpRawFullStream = new ByteArrayOutputStream();
-        
+
         /**
          * {@link DataDumpManager} initialization.
          * 
@@ -640,11 +701,33 @@ public class JavaForwarder {
          * Record the bytes in {@code buffer} forwarded from {@code inputSocket} to {@code outputSocket} as a formatted data
          * dump.
          * 
+         * <p>
+         * <b>Rationale:</b> When DUMP mode is enabled (not DUMP_HTTP), users need to see the raw TCP traffic in hex dump format
+         * for protocol debugging. This method accumulates bytes incrementally as they arrive and formats them into readable
+         * hex+ASCII rows.
+         * </p>
+         * 
+         * <p>
+         * <b>Design Decisions:</b>
+         * <ul>
+         * <li>Uses instance variables (bytesIndex, bytesOffset) to maintain state across calls</li>
+         * <li>Prints thread header and column headers only once (when bytesOffset == 0)</li>
+         * <li>Groups data in DUMP_WIDTH byte rows for readability</li>
+         * <li>Shows both hex values and ASCII representation side-by-side</li>
+         * <li>Thread-safe: uses synchronized mapTimestampDataDump for multi-direction forwarding</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>Difference from DUMP_HTTP:</b> This shows pure raw bytes without any parsing. Use this for non-HTTP protocols or
+         * when you need to see exact wire format.
+         * </p>
+         * 
          * @param localDateTimeForwarding timestamp of forwarding
          * @param buffer                  referencing buffer to read from {@code inputSocket} to record data dump from
          * @param bytesRead               containing the number of bytes actually read from {@code inputSocket}
          */
-        public void record(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead) {
+        private void record(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead) {
             if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP) == null) {
                 return;
             }
@@ -729,14 +812,45 @@ public class JavaForwarder {
         }
 
         /**
-         * Record HTTP traffic in Postman/Bruno-like format with DUMP-style headers.
+         * Record HTTP traffic in DUMP_HTTP format with raw hex dump and parsed content.
          * 
-         * @param localDateTimeForwarding timestamp of forwarding
-         * @param buffer                  data buffer
-         * @param bytesRead               number of bytes read
+         * <p>
+         * <b>Rationale:</b> When DUMP_HTTP is enabled, users want to see both the raw wire format (for debugging protocol
+         * issues) and the parsed, decoded HTTP content (for understanding the actual data). This method accumulates raw bytes
+         * and parses headers on-the-fly.
+         * </p>
+         * 
+         * <p>
+         * <b>Design Decisions:</b>
+         * <ul>
+         * <li>Captures ALL raw bytes in httpRawFullStream for later hex dump</li>
+         * <li>Parses headers incrementally to detect Content-Encoding and Transfer-Encoding</li>
+         * <li>Separates header and body streams for different processing</li>
+         * <li>Thread header and hex column headers printed on first call only</li>
+         * <li>Actual formatting deferred to {@link #resetHttpState()} when message complete</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>State Machine:</b>
+         * <ul>
+         * <li>HEADERS: Accumulating header lines, looking for "\r\n\r\n" separator</li>
+         * <li>BODY: Headers complete, accumulating body bytes</li>
+         * <li>COMPLETE: Message done, trigger output via {@link #resetHttpState()}</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>Called by:</b> {@link ForwardThread#run()} for each data chunk received when HTTP format detected and DUMP_HTTP
+         * enabled.
+         * </p>
+         * 
+         * @param localDateTimeForwarding timestamp of this data chunk
+         * @param buffer                  the raw bytes received from network
+         * @param bytesRead               number of valid bytes in buffer
          * @param direction               CLIENT_TO_SERVER (request) or SERVER_TO_CLIENT (response)
          */
-        public void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead,
+        private void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead,
                 final Direction direction) {
             if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) == null) {
                 return;
@@ -746,7 +860,7 @@ public class JavaForwarder {
                     .toEpochMilli();
             synchronized (mapTimestampDataDump) {
                 httpRawFullStream.write(buffer, 0, bytesRead);
-                
+
                 sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
                 if (sbBufferFormatted == null) {
                     sbBufferFormatted = new StringBuffer();
@@ -803,45 +917,69 @@ public class JavaForwarder {
         }
 
         /**
-         * Reset HTTP state for next request/response and output accumulated body (with decompression if needed).
+         * Finalize and output accumulated HTTP message, then reset state for next message.
+         * 
+         * <p>
+         * <b>Rationale:</b> HTTP messages are accumulated across multiple {@link #recordHttp} calls as data arrives in chunks.
+         * When a message is complete (detected by buffer not full), this method outputs the complete formatted HTTP dump and
+         * resets all state variables.
+         * </p>
+         * 
+         * <p>
+         * <b>Output Format (DUMP_HTTP mode):</b>
+         * <ol>
+         * <li>Raw hex dump of complete message (headers + body as received on wire)</li>
+         * <li>Separator line (matches hex dump width)</li>
+         * <li>Parsed HTTP headers (indented 2 spaces)</li>
+         * <li>Separator line between headers and body</li>
+         * <li>Decoded body (decompressed, de-chunked, indented 2 spaces)</li>
+         * </ol>
+         * </p>
+         * 
+         * <p>
+         * <b>Processing Order:</b> Remove chunked encoding BEFORE decompression, since Transfer-Encoding and Content-Encoding
+         * are applied in layers (chunk, then compress).
+         * </p>
+         * 
+         * <p>
+         * <b>Called by:</b> {@link ForwardThread#run()} when detecting end of HTTP message (bytesRead < BUFFER_SIZE).
+         * </p>
          */
-        public void resetHttpState() {
+        private void resetHttpState() {
             if (httpRawFullStream.size() > 0 && sbBufferFormatted != null) {
                 synchronized (mapTimestampDataDump) {
                     byte[] allRawBytes = httpRawFullStream.toByteArray();
-                    
+
                     appendRawHexDump(allRawBytes);
-                    
+
                     sbBufferFormatted.append("  -------");
                     for (int i = 0; i < DUMP_WIDTH; i++) {
                         sbBufferFormatted.append("----");
                     }
                     sbBufferFormatted.append(System.lineSeparator());
-                    
+
                     String headers = httpHeaderBuffer.toString();
                     if (!headers.isEmpty()) {
                         String[] headerLines = headers.split("\r\n");
                         for (String line : headerLines) {
                             sbBufferFormatted.append("  ").append(line).append(System.lineSeparator());
                         }
-                        
+
                         sbBufferFormatted.append("  -------");
                         for (int i = 0; i < DUMP_WIDTH; i++) {
                             sbBufferFormatted.append("----");
                         }
                         sbBufferFormatted.append(System.lineSeparator());
                     }
-                    
+
                     byte[] rawBody = httpRawBodyStream.toByteArray();
                     byte[] cleanBody = isChunkedEncoding ? removeChunkEncoding(rawBody) : rawBody;
                     byte[] decodedBody = decompressBody(cleanBody, httpContentEncoding);
                     appendIndentedBodyWithWidth(decodedBody);
                 }
             }
-
             httpRawFullStream = new ByteArrayOutputStream();
             httpHeaderBuffer = new StringBuilder();
-            httpBodyBuffer = new StringBuilder();
             httpRawBodyStream = new ByteArrayOutputStream();
             httpContentEncoding = null;
             isChunkedEncoding = false;
@@ -849,9 +987,29 @@ public class JavaForwarder {
         }
 
         /**
-         * Log the recorded data dump by increasing timestamp.
+         * Log the recorded data dump by increasing timestamp and clear the buffer.
+         * 
+         * <p>
+         * <b>Rationale:</b> Data dumps are accumulated in memory (mapTimestampDataDump) during forwarding to avoid interleaved
+         * output from multiple threads. When a ForwardThread completes (connection closed or error), this method outputs all
+         * accumulated dumps in chronological order.
+         * </p>
+         * 
+         * <p>
+         * <b>Thread Safety:</b> Uses synchronized block because both CLIENT_TO_SERVER and SERVER_TO_CLIENT threads share the
+         * same mapTimestampDataDump static map.
+         * </p>
+         * 
+         * <p>
+         * <b>Memory Management:</b> Clears the map after printing to free memory, especially important for long-running proxy
+         * instances handling many connections.
+         * </p>
+         * 
+         * <p>
+         * <b>Called by:</b> {@link ForwardThread#run()} in the finally block, ensuring output even if an exception occurs.
+         * </p>
          */
-        public void logDataDump() {
+        private void logDataDump() {
             synchronized (mapTimestampDataDump) {
                 for (Entry<Long, StringBuffer> mapEntry : mapTimestampDataDump.entrySet()) {
                     System.out.print(mapEntry.getValue());
@@ -861,57 +1019,28 @@ public class JavaForwarder {
         }
 
         /**
-         * Append body content respecting DUMP_WIDTH for binary content.
+         * Extract a header value from HTTP headers string.
          * 
-         * @param bodyBytes the body bytes (potentially decompressed)
-         */
-        private void appendBodyWithWidth(byte[] bodyBytes) {
-            if (bodyBytes.length == 0)
-                return;
-
-            // Check if printable text
-            boolean isText = true;
-            for (byte b : bodyBytes) {
-                if (b < 32 && b != '\r' && b != '\n' && b != '\t') {
-                    isText = false;
-                    break;
-                }
-            }
-
-            if (isText) {
-                // Text content: output as-is
-                sbBufferFormatted.append(new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8));
-            } else {
-                // Binary content: hex dump respecting DUMP_WIDTH
-                sbBufferFormatted.append("  [Binary body - hex dump]").append(System.lineSeparator());
-                for (int i = 0; i < bodyBytes.length; i += DUMP_WIDTH) {
-                    sbBufferFormatted.append(String.format("  %06X ", i));
-                    // Hex part
-                    for (int j = 0; j < DUMP_WIDTH; j++) {
-                        if (i + j < bodyBytes.length) {
-                            sbBufferFormatted.append(String.format("%02X ", bodyBytes[i + j]));
-                        } else {
-                            sbBufferFormatted.append("   ");
-                        }
-                    }
-                    // ASCII part
-                    for (int j = 0; j < DUMP_WIDTH && i + j < bodyBytes.length; j++) {
-                        char c = (char) bodyBytes[i + j];
-                        sbBufferFormatted.append(c >= 32 && c < 127 ? c : '.');
-                    }
-                    sbBufferFormatted.append(System.lineSeparator());
-                }
-            }
-        }
-
-        /**
-         * Extract a header value from headers string.
+         * <p>
+         * <b>Rationale:</b> HTTP headers are case-insensitive by RFC specification. We need to extract specific headers
+         * (Content-Encoding, Transfer-Encoding) to properly decode the body. Simple string split wouldn't handle case
+         * variations like "content-encoding".
+         * </p>
          * 
-         * @param headers    the headers string
-         * @param headerName the header name to find
-         * @return the header value or null if not found
+         * <p>
+         * <b>Format:</b> HTTP headers are "Name: Value" pairs separated by CRLF:
+         * 
+         * <pre>
+         * Content-Type: application/json\r\n
+         * Content-Encoding: gzip\r\n
+         * </pre>
+         * </p>
+         * 
+         * @param headers    the complete headers string (all lines)
+         * @param headerName the header name to find (case-insensitive)
+         * @return the header value (trimmed), or null if header not found
          */
-        private String extractHeader(String headers, String headerName) {
+        private String extractHeader(final String headers, final String headerName) {
             String[] lines = headers.split("\r\n");
             for (String line : lines) {
                 int colonPos = line.indexOf(':');
@@ -926,9 +1055,24 @@ public class JavaForwarder {
         }
 
         /**
-         * Extract body bytes from buffer after header end.
+         * Extract body bytes from buffer after the header section ends.
+         * 
+         * <p>
+         * <b>Rationale:</b> HTTP messages consist of headers and body separated by "\r\n\r\n". When we detect this separator in
+         * {@link #recordHttp}, we need to extract any body bytes that arrived in the same buffer as the headers.
+         * </p>
+         * 
+         * <p>
+         * <b>Example:</b> If buffer contains "Content-Type: text\r\n\r\nHello", and headerEnd points to the first '\r',
+         * bodyStart would be headerEnd+4, pointing to 'H'.
+         * </p>
+         * 
+         * @param buffer    the complete buffer containing headers and possibly body
+         * @param bytesRead total bytes in the buffer
+         * @param bodyStart index where body begins (after "\r\n\r\n")
+         * @return byte array containing only the body portion, or empty array if none
          */
-        private byte[] extractBodyBytes(byte[] buffer, int bytesRead, int bodyStart) {
+        private byte[] extractBodyBytes(final byte[] buffer, final int bytesRead, final int bodyStart) {
             int bodyLength = bytesRead - bodyStart;
             if (bodyLength <= 0)
                 return new byte[0];
@@ -940,15 +1084,38 @@ public class JavaForwarder {
         /**
          * Decompress body if Content-Encoding indicates compression.
          * 
-         * @param rawBody         the raw body bytes
-         * @param contentEncoding the Content-Encoding header value
+         * <p>
+         * <b>Rationale:</b> HTTP servers often compress responses with gzip or deflate to reduce bandwidth. Without
+         * decompression, DUMP_HTTP would show binary garbage instead of readable content. This method transparently
+         * decompresses based on Content-Encoding header.
+         * </p>
+         * 
+         * <p>
+         * <b>Supported Encodings:</b>
+         * <ul>
+         * <li>gzip - Most common, uses {@link java.util.zip.GZIPInputStream}</li>
+         * <li>deflate - Less common, uses {@link java.util.zip.InflaterInputStream}</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>Error Handling:</b> If decompression fails (corrupt data, wrong encoding), returns original bytes and logs error.
+         * This allows partial debugging even with corrupted responses.
+         * </p>
+         * 
+         * <p>
+         * <b>Processing Order:</b> Must be called AFTER {@link #removeChunkEncoding()} since HTTP applies chunking as outer
+         * layer, compression as inner layer.
+         * </p>
+         * 
+         * @param rawBody         the raw body bytes (possibly compressed, already de-chunked)
+         * @param contentEncoding the Content-Encoding header value ("gzip", "deflate", etc.)
          * @return decompressed bytes, or original if not compressed or on error
          */
-        private byte[] decompressBody(byte[] rawBody, String contentEncoding) {
+        private byte[] decompressBody(final byte[] rawBody, final String contentEncoding) {
             if (contentEncoding == null || rawBody.length == 0) {
                 return rawBody;
             }
-
             try {
                 if ("gzip".equalsIgnoreCase(contentEncoding)) {
                     return readAllBytes(new GZIPInputStream(new ByteArrayInputStream(rawBody)));
@@ -957,15 +1124,29 @@ public class JavaForwarder {
                 }
             } catch (IOException e) {
                 // Decompression failed, return original with error note
-                System.err.println("JavaForwarder: Decompression failed (" + contentEncoding + "): " + e.getMessage());
+                System.err.println("JavaForwarder decompression failed (" + contentEncoding + "): " + e.getMessage());
             }
             return rawBody;
         }
 
         /**
-         * Read all bytes from an InputStream.
+         * Read all bytes from an InputStream into a byte array.
+         * 
+         * <p>
+         * <b>Rationale:</b> Decompression streams (GZIP, Deflate) don't provide length information upfront. We need to read
+         * until EOF to get the complete decompressed content. This helper method handles the buffering and accumulation.
+         * </p>
+         * 
+         * <p>
+         * <b>Note:</b> Java 9+ has {@code InputStream.readAllBytes()}, but this implementation maintains compatibility with
+         * Java 8.
+         * </p>
+         * 
+         * @param is the input stream to read from (will be closed)
+         * @return byte array containing all data from stream
+         * @throws IOException if reading fails
          */
-        private byte[] readAllBytes(InputStream is) throws IOException {
+        private byte[] readAllBytes(final InputStream is) throws IOException {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             byte[] buf = new byte[8192];
             int r;
@@ -976,19 +1157,52 @@ public class JavaForwarder {
             return baos.toByteArray();
         }
 
-        private byte[] removeChunkEncoding(byte[] chunkedBody) {
+        /**
+         * Parse and remove HTTP chunked transfer encoding from body bytes.
+         * 
+         * <p>
+         * <b>Rationale:</b> HTTP/1.1 chunked encoding wraps body content with chunk size metadata:
+         * 
+         * <pre>
+         * d\r\n              ← chunk size in hex (13 bytes)
+         * Hello World!\r\n   ← actual data
+         * 0\r\n              ← last chunk (size 0)
+         * \r\n               ← trailing CRLF
+         * </pre>
+         * 
+         * For DUMP_HTTP output, users want to see the clean body content without these control characters. The raw hex dump
+         * already shows the complete wire format including chunks.
+         * </p>
+         * 
+         * <p>
+         * <b>Process:</b>
+         * <ol>
+         * <li>Read chunk size line (hex number ending with CRLF)</li>
+         * <li>Extract that many bytes of data</li>
+         * <li>Skip trailing CRLF after data</li>
+         * <li>Repeat until chunk size is 0</li>
+         * </ol>
+         * </p>
+         * 
+         * @param chunkedBody the raw body bytes with chunked encoding
+         * @return clean body bytes with chunk metadata removed
+         */
+        private byte[] removeChunkEncoding(final byte[] chunkedBody) {
             ByteArrayOutputStream clean = new ByteArrayOutputStream();
             int pos = 0;
             while (pos < chunkedBody.length) {
                 // Find chunk size line (ends with \r\n)
                 int crlfPos = findCRLF(chunkedBody, pos);
-                if (crlfPos == -1) break;
-                
+                if (crlfPos == -1) {
+                    break;
+                }
                 String sizeLine = new String(chunkedBody, pos, crlfPos - pos, StandardCharsets.US_ASCII);
                 int chunkSize = Integer.parseInt(sizeLine.trim().split(";")[0], 16);
-                
-                if (chunkSize == 0) break; // Last chunk
-                
+
+                if (chunkSize == 0) {
+                    // Last chunk
+                    break;
+                }
                 pos = crlfPos + 2; // Skip \r\n
                 clean.write(chunkedBody, pos, chunkSize);
                 pos += chunkSize + 2; // Skip chunk data + trailing \r\n
@@ -997,24 +1211,44 @@ public class JavaForwarder {
         }
 
         /**
-         * Append raw hex dump of bytes to sbBufferFormatted.
-         * Does NOT print thread header (assumed already printed by caller).
+         * Append raw hex dump of bytes to sbBufferFormatted without thread header.
+         * 
+         * <p>
+         * <b>Rationale:</b> Both DUMP and DUMP_HTTP modes need hex dump formatting, but with different context. This method
+         * extracts the core hex formatting logic for reuse:
+         * <ul>
+         * <li>DUMP mode: {@link #record()} calls this implicitly (inline code)</li>
+         * <li>DUMP_HTTP mode: {@link #resetHttpState()} calls this explicitly</li>
+         * </ul>
+         * </p>
+         * 
+         * <p>
+         * <b>Design:</b> Uses local variables (not instance variables) to be self-contained. Assumes caller has already printed
+         * thread header and column headers. Formats complete byte array in one pass (vs incremental in {@link #record()}).
+         * </p>
+         * 
+         * <p>
+         * <b>Output Format:</b> Each row shows:
+         * <ul>
+         * <li>Offset in hex (6 digits)</li>
+         * <li>DUMP_WIDTH bytes in hex (2 digits each + space)</li>
+         * <li>ASCII representation (printable chars or space)</li>
+         * </ul>
+         * Last row is padded with spaces if incomplete.
+         * </p>
          * 
          * @param rawBytes the complete byte array to dump
          */
-        private void appendRawHexDump(byte[] rawBytes) {
+        private void appendRawHexDump(final byte[] rawBytes) {
             int localBytesIndex = 0;
             int localBytesOffset = 0;
             StringBuffer localDataHex = new StringBuffer();
             StringBuffer localDataChar = new StringBuffer();
-            
             for (int bufferOffset = 0; bufferOffset < rawBytes.length; bufferOffset++) {
                 byte dataByte = rawBytes[bufferOffset];
-                
                 if (localBytesIndex == 0) {
                     localDataHex.append(String.format("  %06X ", localBytesOffset));
                 }
-                
                 localDataHex.append(String.format("%02X ", dataByte));
                 Character dataByteChar = new Character((char) dataByte);
                 int type = Character.getType(dataByteChar);
@@ -1024,10 +1258,8 @@ public class JavaForwarder {
                 } else {
                     localDataChar.append(dataByteChar);
                 }
-                
                 localBytesOffset++;
                 localBytesIndex++;
-                
                 if (localBytesIndex >= DUMP_WIDTH) {
                     sbBufferFormatted.append(localDataHex).append(localDataChar).append(System.lineSeparator());
                     localDataHex = new StringBuffer();
@@ -1035,7 +1267,6 @@ public class JavaForwarder {
                     localBytesIndex = 0;
                 }
             }
-            
             if (localBytesIndex > 0) {
                 for (int bytesIndexNoData = localBytesIndex; bytesIndexNoData < DUMP_WIDTH; bytesIndexNoData++) {
                     localDataHex.append("   ");
@@ -1043,15 +1274,30 @@ public class JavaForwarder {
                 sbBufferFormatted.append(localDataHex).append(localDataChar).append(System.lineSeparator());
             }
         }
-        
-        /**
-         * Append body content with 2-space indent, respecting DUMP_WIDTH for binary content.
-         * 
-         * @param bodyBytes the body bytes (potentially decompressed and de-chunked)
-         */
-        private void appendIndentedBodyWithWidth(byte[] bodyBytes) {
-            if (bodyBytes.length == 0) return;
 
+        /**
+         * Append HTTP body content with 2-space indentation for DUMP_HTTP format.
+         * 
+         * <p>
+         * <b>Rationale:</b> In DUMP_HTTP mode, the body content should be indented to visually align with the HTTP headers
+         * (which are also indented 2 spaces). This creates a clean, readable format similar to Postman/Bruno HTTP clients.
+         * </p>
+         * 
+         * <p>
+         * <b>Behavior:</b>
+         * <ul>
+         * <li>Text bodies: Each line prefixed with 2 spaces, preserves line breaks</li>
+         * <li>Binary bodies: Hex dump with 4-space indent (2 for alignment + 2 for offset column)</li>
+         * <li>Respects DUMP_WIDTH for binary hex dump formatting</li>
+         * <li>No trailing newline added (caller controls spacing)</li>
+         * </ul>
+         * </p>
+         * 
+         * @param bodyBytes the body bytes (already decompressed and de-chunked)
+         */
+        private void appendIndentedBodyWithWidth(final byte[] bodyBytes) {
+            if (bodyBytes.length == 0)
+                return;
             boolean isText = true;
             for (byte b : bodyBytes) {
                 if (b < 32 && b != '\r' && b != '\n' && b != '\t') {
@@ -1059,7 +1305,6 @@ public class JavaForwarder {
                     break;
                 }
             }
-
             if (isText) {
                 String bodyText = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
                 String[] lines = bodyText.split("\n", -1);
@@ -1093,14 +1338,32 @@ public class JavaForwarder {
                 }
             }
         }
-        
-        private int findCRLF(byte[] data, int start) {
+
+        /**
+         * Find the next CRLF (Carriage Return + Line Feed) sequence in a byte array.
+         * 
+         * <p>
+         * <b>Rationale:</b> HTTP uses CRLF (\r\n) as line terminators. When parsing chunked transfer encoding, we need to find
+         * chunk size lines which are terminated by CRLF. This helper method encapsulates the scanning logic.
+         * </p>
+         * 
+         * <p>
+         * <b>Example:</b> In chunked body "d\r\nHello World!\r\n0\r\n\r\n", this finds the CRLF positions to separate chunk
+         * size lines from chunk data.
+         * </p>
+         * 
+         * @param data  the byte array to search
+         * @param start the starting position in the array
+         * @return the index of '\r' in the CRLF sequence, or -1 if not found
+         */
+        private int findCRLF(final byte[] data, final int start) {
             for (int i = start; i < data.length - 1; i++) {
-                if (data[i] == '\r' && data[i+1] == '\n') return i;
+                if (data[i] == '\r' && data[i + 1] == '\n')
+                    return i;
             }
             return -1;
         }
-        
+
     }
 
     /**
@@ -1109,8 +1372,8 @@ public class JavaForwarder {
      * @param args to use and validate
      * @throws IOException
      */
-    public static void main(String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.17 (C) by Roman.Stangl@gmx.net");
+    public static void main(final String[] args) throws IOException {
+        System.out.println("JavaForwarder v1.20 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
@@ -1144,7 +1407,12 @@ public class JavaForwarder {
             // And start running the server
             ProxyThread proxyThread = new ProxyThread(protocol, remoteHost, remotePort, localPort);
             proxyThread.start();
-            Thread.sleep(100);
+            Thread.sleep(500);
+            // Check if proxy thread is still alive after startup
+            if (!proxyThread.isAlive()) {
+                System.out.println("JavaForwarder startup failed, exiting ...");
+                return;
+            }
             // Wait for quitting
             System.out.println("JavaForwarder waiting for client connection(s), press Enter to terminate JavaForwarder ...");
             try {
@@ -1180,19 +1448,35 @@ public class JavaForwarder {
         List<ClientThread> clientThreads = new ArrayList<>();
         if (Protocol.TCP == protocol) {
             // Creating a ServerSocket to listen for connections
-            while (!JavaForwarder.doExit) {
-                try (ServerSocket serverSocket = new ServerSocket(localPort)) {
-                    serverSocket.setSoTimeout(1000);
-                    while (true) {
-                        Socket clientSocket = serverSocket.accept();
-                        ClientThread clientThread = new ClientThread(protocol, clientSocket, remoteHost, remotePort);
-                        System.out.println("JavaForwarder accepted client thread ...");
-                        clientThreads.add(clientThread);
-                        clientThread.start();
+            ServerSocket serverSocket = null;
+            try {
+                serverSocket = new ServerSocket(localPort);
+                serverSocket.setSoTimeout(1000);
+                while (!JavaForwarder.doExit) {
+                    try {
+                        while (true) {
+                            Socket clientSocket = serverSocket.accept();
+                            ClientThread clientThread = new ClientThread(protocol, clientSocket, remoteHost, remotePort);
+                            System.out.println("JavaForwarder accepted client thread ...");
+                            clientThreads.add(clientThread);
+                            clientThread.start();
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // Ignore so we can check for termination request
                     }
-                } catch (SocketTimeoutException e) {
-                    // Ignore so we can check for termination request
-                } finally {
+                }
+            } catch (BindException e) {
+                System.err.println("JavaForwarder port " + localPort + " is already in use.");
+                System.err.println(
+                        "JavaForwarder cannot start server. Please check if another instance is running or choose a different port.");
+                JavaForwarder.doExit = true;
+            } finally {
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    try {
+                        serverSocket.close();
+                    } catch (IOException e) {
+                        // Ignore
+                    }
                 }
             }
         } else if (Protocol.UDP == protocol) {
@@ -1211,10 +1495,17 @@ public class JavaForwarder {
                     } catch (InterruptedException e) {
                     }
                 }
+            } catch (BindException e) {
+                System.err.println("JavaForwarder port " + localPort + " is already in use.");
+                System.err.println(
+                        "JavaForwarder cannot start server. Please check if another instance is running or choose a different port.");
+                JavaForwarder.doExit = true;
             } catch (SocketException e) {
                 // SocketTimeoutException ?
                 // Ignore so we can check for termination request
-                e.printStackTrace();
+                if (!JavaForwarder.doExit) {
+                    e.printStackTrace();
+                }
             } finally {
             }
             while (!JavaForwarder.doExit) {
@@ -1238,8 +1529,60 @@ public class JavaForwarder {
     /**
      * Retrieve a configuration value from JVM system properties or OS environment variables.
      * 
+     * <p>
+     * <b>Rationale:</b> JavaForwarder can be configured either via:
+     * <ul>
+     * <li>JVM system properties: {@code java -DDUMP=true -jar JavaForwarder.jar ...}</li>
+     * <li>OS environment variables: {@code export DUMP=true; java -jar JavaForwarder.jar ...}</li>
+     * </ul>
+     * 
+     * This dual approach provides flexibility:
+     * <ul>
+     * <li>System properties: Per-invocation configuration, useful in scripts</li>
+     * <li>Environment variables: Session/user-wide configuration, easier for interactive use</li>
+     * </ul>
+     * </p>
+     * 
+     * <p>
+     * <b>Precedence:</b> System properties take priority over environment variables. This allows command-line overrides of
+     * environment defaults:
+     * 
+     * <pre>
+     * export DUMP_WIDTH=32              # Default for session
+     * java -DDUMP_WIDTH=64 ...          # Override for this run only
+     * </pre>
+     * </p>
+     * 
+     * <p>
+     * <b>Empty String Handling:</b> Empty strings are treated as null (not set). This prevents confusion when environment
+     * variable is defined but empty: {@code export DUMP=}
+     * </p>
+     * 
+     * <p>
+     * <b>Usage Pattern:</b>
+     * 
+     * <pre>
+     * // Check if feature enabled (any non-null value)
+     * boolean dumpEnabled = getPropertyOrEnvironmentVariable("DUMP") != null;
+     * 
+     * // Get specific value with parsing
+     * String widthStr = getPropertyOrEnvironmentVariable("DUMP_WIDTH");
+     * int width = widthStr != null ? Integer.parseInt(widthStr) : 16;
+     * </pre>
+     * </p>
+     * 
+     * <p>
+     * <b>Supported Configuration Keys:</b>
+     * <ul>
+     * <li>{@link #ENVIRONMENT_VARIABLE_MODE} - Protocol: TCP or UDP</li>
+     * <li>{@link #ENVIRONMENT_VARIABLE_DUMP} - Enable hex dump output</li>
+     * <li>{@link #ENVIRONMENT_VARIABLE_DUMP_HTTP} - Enable HTTP-aware dump output</li>
+     * <li>{@link #ENVIRONMENT_VARIALBE_DUMP_WIDTH} - Bytes per row in hex dump (multiple of 16)</li>
+     * </ul>
+     * </p>
+     * 
      * @param key the name of the property or environment variable
-     * @return the value found, or null if not found
+     * @return the value found, or null if not found or empty
      */
     private static String getPropertyOrEnvironmentVariable(final String key) {
         String value = System.getProperty(key);
