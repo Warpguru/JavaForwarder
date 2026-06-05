@@ -12,8 +12,11 @@ import java.io.OutputStream;
 import java.net.BindException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetSocketAddress;
+import java.net.PortUnreachableException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -95,6 +98,8 @@ public class JavaForwarder {
         private String remoteHost;
         /** Remote port. */
         private int remotePort;
+        /** Address of ?. */
+        private volatile SocketAddress clientAddress = null;
 
         /** {@link Socket} connected to {@code remoteHost:remotePort}. */
         private Socket serverSocket;
@@ -209,11 +214,13 @@ public class JavaForwarder {
                     System.out.println("JavaForwarder connecting to server ...");
                     // Connect to the destination server
                     serverDatagramSocket = new DatagramSocket();
-                    System.out.println("JavaForwarder connected to server");
+                    // TODO: Remove once it is working
+                    // serverDatagramSocket.connect(InetAddress.getByName(remoteHost), remotePort);
+                    System.out.println("JavaForwarder connected to server (UDP)");
                 } catch (Exception e) {
                     e.printStackTrace();
-//                  System.err.println("JavaForwarder failed to connect to initiate " + protocol + " connection: " + remoteHost
-//                          + ":" + remotePort);
+                    System.err.println("JavaForwarder failed to connect to initiate " + protocol + " connection: " + remoteHost
+                            + ":" + remotePort);
                     connectionBroken();
                     JavaForwarder.doExit = true;
                     System.out.println("JavaForwarder failed to start, press Enter to terminate JavaForwarder ...");
@@ -221,14 +228,13 @@ public class JavaForwarder {
                 }
                 // Start forwarding data between server and client
                 forwardingActive = true;
-                ForwardThread clientForward = new ForwardThread(this, protocol, clientDatagramSocket, serverDatagramSocket);
+                ForwardThread clientForward = new ForwardThread(this, protocol, clientDatagramSocket, serverDatagramSocket,
+                        Direction.CLIENT_TO_SERVER);
                 clientForward.start();
-//              ForwardThread serverForward = new ForwardThread(this, protocol, serverDatagramSocket, clientDatagramSocket);
-//              serverForward.start();
-//              System.out.println("JavaForwarder " + protocol + " connection: "
-//                      + clientDatagramSocket.getInetAddress().getHostAddress() + ":" + clientDatagramSocket.getPort()
-//                      + " <--> " + serverDatagramSocket.getInetAddress().getHostAddress() + ":"
-//                      + serverDatagramSocket.getPort() + " started");
+                ForwardThread serverForward = new ForwardThread(this, protocol, serverDatagramSocket, clientDatagramSocket,
+                        Direction.SERVER_TO_CLIENT);
+                serverForward.start();
+                // Can't log connection details, as client has not connected yet
             }
         }
 
@@ -241,6 +247,13 @@ public class JavaForwarder {
         public synchronized void forwardingDirectionComplete(final Direction direction) {
             directionActive.put(direction, false);
             System.out.println("JavaForwarder " + direction + " forwarding completed");
+            // For UDP, if one direction finishes, close both sockets to unblock the other thread
+            if (protocol == Protocol.UDP) {
+                if (serverDatagramSocket != null)
+                    serverDatagramSocket.close();
+                if (clientDatagramSocket != null)
+                    clientDatagramSocket.close();
+            }
             // When server closes (SERVER_TO_CLIENT completes), close the client socket
             // to unblock CLIENT_TO_SERVER thread which is waiting on clientInputStream.read()
             if (direction == Direction.SERVER_TO_CLIENT && clientSocket != null && !clientSocket.isClosed()) {
@@ -429,6 +442,23 @@ public class JavaForwarder {
             }
             return false;
         }
+
+        public String getRemoteHost() {
+            return remoteHost;
+        }
+
+        public int getRemotePort() {
+            return remotePort;
+        }
+
+        public SocketAddress getClientAddress() {
+            return clientAddress;
+        }
+
+        public void setClientAddress(SocketAddress clientAddress) {
+            this.clientAddress = clientAddress;
+        }
+
     }
 
     /**
@@ -478,7 +508,8 @@ public class JavaForwarder {
      */
     private static class ForwardThread extends Thread {
 
-        private static final int BUFFER_SIZE = 8192;
+        /** Data buffer, for TCP you retrieve in chunks, for UDP only 1 chunk with max. size of 65507 is possible. */
+        private static final int BUFFER_SIZE = 65536;
 
         final private ClientThread clientThread;
         /** Type of {@code IP} data to forward. */
@@ -531,9 +562,10 @@ public class JavaForwarder {
          * @param protocol             of {@code IP} data to forward
          * @param inputDatagramSocket  to read data from
          * @param outputDatagramSocket to write data to
+         * @param direction            of data flow (client to server or server to client)
          */
         public ForwardThread(final ClientThread clientThread, final Protocol protocol, final DatagramSocket inputDatagramSocket,
-                final DatagramSocket outputDatagramSocket) {
+                final DatagramSocket outputDatagramSocket, final Direction direction) {
             super();
             this.clientThread = clientThread;
             this.protocol = protocol;
@@ -543,7 +575,7 @@ public class JavaForwarder {
             this.outputDatagramSocket = outputDatagramSocket;
             this.inputStream = null;
             this.outputStream = null;
-            this.direction = null;
+            this.direction = direction;
         }
 
         /**
@@ -554,14 +586,15 @@ public class JavaForwarder {
             final byte[] buffer = new byte[BUFFER_SIZE];
             LocalDateTime localDateTimeForward = null;
             if (Protocol.TCP == protocol) {
-                final DataDumpManager dataDumpManager = new DataDumpManager(Thread.currentThread().getId(), inputSocket,
-                        outputSocket);
+                final DataDumpManager dataDumpManager = new DataDumpManager(Thread.currentThread().getId(), protocol,
+                        inputSocket.getInetAddress().getHostAddress(), String.valueOf(inputSocket.getPort()),
+                        outputSocket.getInetAddress().getHostAddress(), String.valueOf(outputSocket.getPort()));
                 // Check if DUMP_HTTP is enabled
                 final boolean dumpHttpEnabled = JavaForwarder
                         .getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
                 try {
                     while (!JavaForwarder.doExit) {
-                        System.out.println("JavaForwarderd " + direction + " waiting for data...");
+                        System.out.println("JavaForwarder " + direction + " waiting for data...");
                         int bytesRead = inputStream.read(buffer);
                         System.out.println("JavaForwarder " + direction + " read " + bytesRead + " bytes");
                         // If end of stream is reached --> exit
@@ -606,28 +639,49 @@ public class JavaForwarder {
                 // Notify parent thread that the connection is broken
                 clientThread.connectionBroken();
             } else if (Protocol.UDP == protocol) {
+                final DataDumpManager dataDumpManager = new DataDumpManager(Thread.currentThread().getId(), protocol);
                 try {
                     while (!JavaForwarder.doExit) {
                         DatagramPacket inputDatagramPacket = new DatagramPacket(buffer, buffer.length);
                         try {
                             inputDatagramSocket.receive(inputDatagramPacket);
-                            // Record data read
-                            if (localDateTimeForward == null) {
-                                localDateTimeForward = LocalDateTime.now();
+                            final String inputAddress = inputDatagramPacket.getAddress().getHostAddress();
+                            final String inputPort = String.valueOf(inputDatagramPacket.getPort());
+                            SocketAddress serverAddress = null;
+                            if (Direction.CLIENT_TO_SERVER == direction) {
+                                clientThread.setClientAddress(inputDatagramPacket.getSocketAddress());
+                                serverAddress = new InetSocketAddress(clientThread.getRemoteHost(),
+                                        clientThread.getRemotePort());
+                            } else if (Direction.SERVER_TO_CLIENT == direction) {
+                                serverAddress = clientThread.getClientAddress();
+                                if (serverAddress == null) {
+                                    // If we haven't seen a client packet yet, we can't send anything back to the client
+                                    continue;
+                                }
                             }
-                            String clientMessage = new String(inputDatagramPacket.getData(), 0,
-                                    inputDatagramPacket.getLength());
-                            System.out.println(clientMessage);
+                            inputDatagramPacket.setSocketAddress(serverAddress);
+                            outputDatagramSocket.send(inputDatagramPacket);
+                            // Record data read
+                            dataDumpManager.setInputAddress(inputAddress);
+                            dataDumpManager.setInputPort(inputPort);
+                            dataDumpManager.setOutputAddress(((InetSocketAddress) serverAddress).getAddress().getHostAddress());
+                            dataDumpManager.setOutputPort(String.valueOf(((InetSocketAddress) serverAddress).getPort()));
+                            dataDumpManager.record(LocalDateTime.now(), inputDatagramPacket);
+                            dataDumpManager.logDataDump();
+                        } catch (PortUnreachableException e) {
+                            System.out.println("JavaForwarder ICMP Port Unreachable (Destination unreachable)");
                         } catch (SocketTimeoutException e) {
                             // Ignore timeout and continue waiting until we should exist
                         }
                     }
                 } catch (Exception e) {
-                    // ???
-                    e.printStackTrace();
+                    // Connection closed or forced closed, ignore
+                } finally {
+                    // Signal that this direction has finished
+                    clientThread.forwardingDirectionComplete(direction);
+                    // Notify parent thread that the connection is broken
+                    clientThread.connectionBroken();
                 }
-                // Notify parent thread that the connection is broken
-                clientThread.connectionBroken();
             }
         }
     }
@@ -645,12 +699,18 @@ public class JavaForwarder {
 
         /** ID of thread executing {@link ForwardThread} instance. */
         private Long threadId = null;
-        /** {@link Socket} data is read from. */
-        private Socket inputSocket = null;
-        /** {@link Socket} data is forwarded (copied) to. */
-        private Socket outputSocket = null;
+        /** {@link Protocol} used. */
+        private Protocol protocol = null;
+        /** IP address data is read from. */
+        private String inputAddress = null;
+        /** IP port data is read from. */
+        private String inputPort = null;
+        /** IP address data is written to. */
+        private String outputAddress = null;
+        /** IP port data is written to. */
+        private String outputPort = null;
 
-        /** Number of bytes dumped from data dump in a single line. */
+        /** Default number of bytes dumped from data dump in a single line. */
         private int DUMP_WIDTH = 16;
 
         /** Index in row to record formatted next byte of data dump. */
@@ -677,17 +737,34 @@ public class JavaForwarder {
         private ByteArrayOutputStream httpRawFullStream = new ByteArrayOutputStream();
 
         /**
+         * {@link DataDumpManager} initialization for {@code UDP}.
+         * 
+         * @param threadId of thread forwarding data from {@code inputSocket} to {@code outputSocket}
+         * @param protocol {@link Protocol} of underlying communication
+         */
+        public DataDumpManager(final Long threadId, final Protocol protocol) {
+            this(threadId, protocol, null, null, null, null);
+        }
+
+        /**
          * {@link DataDumpManager} initialization.
          * 
-         * @param threadId     of thread forwarding data from {@code inputSocket} to {@code outputSocket}
-         * @param inputSocket  to record host and port
-         * @param outputSocket to record host and port
+         * @param threadId      of thread forwarding data from {@code inputSocket} to {@code outputSocket}
+         * @param protocol      {@link Protocol} of underlying communication
+         * @param inputAddress  to record input host
+         * @param inputPort     to record input port
+         * @param outputAddress to record output host
+         * @param outputPort    to record output port
          */
-        public DataDumpManager(final Long threadId, final Socket inputSocket, final Socket outputSocket) {
+        public DataDumpManager(final Long threadId, final Protocol protocol, final String inputAddress, final String inputPort,
+                final String outputAddress, final String outputPort) {
             super();
             this.threadId = threadId;
-            this.inputSocket = inputSocket;
-            this.outputSocket = outputSocket;
+            this.protocol = protocol;
+            this.inputAddress = inputAddress;
+            this.inputPort = inputPort;
+            this.outputAddress = outputAddress;
+            this.outputPort = outputPort;
             try {
                 Integer dumpWidth = Integer
                         .valueOf(JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIALBE_DUMP_WIDTH));
@@ -697,9 +774,19 @@ public class JavaForwarder {
             }
         }
 
+        public void record(final LocalDateTime localDateTimeForward, final DatagramPacket datagramPacket) {
+            if (Protocol.UDP != protocol) {
+                return;
+            }
+            if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP) == null) {
+                return;
+            }
+            record(localDateTimeForward, datagramPacket.getData(), datagramPacket.getLength());
+        }
+
         /**
          * Record the bytes in {@code buffer} forwarded from {@code inputSocket} to {@code outputSocket} as a formatted data
-         * dump.
+         * dump for {@code TCP} traffic.
          * 
          * <p>
          * <b>Rationale:</b> When DUMP mode is enabled (not DUMP_HTTP), users need to see the raw TCP traffic in hex dump format
@@ -727,35 +814,42 @@ public class JavaForwarder {
          * @param buffer                  referencing buffer to read from {@code inputSocket} to record data dump from
          * @param bytesRead               containing the number of bytes actually read from {@code inputSocket}
          */
-        private void record(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead) {
+        public void record(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead) {
             if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP) == null) {
                 return;
             }
-            // Retrieve buffer to record data dump from buffer into
-            final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault()).toInstant()
-                    .toEpochMilli();
-            synchronized (mapTimestampDataDump) {
-                sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
-                if (sbBufferFormatted == null) {
-                    this.bytesIndex = 0;
-                    this.bytesOffset = 0;
-                    this.sbDataHex = new StringBuffer();
-                    this.sbDataChar = new StringBuffer();
-                    sbBufferFormatted = new StringBuffer();
-                    mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
+            if (Protocol.TCP == protocol) {
+                // Retrieve buffer to record data dump from buffer into
+                final long timeForwardingMilliSeconds = localDateTimeForwarding.atZone(ZoneId.systemDefault()).toInstant()
+                        .toEpochMilli();
+                synchronized (mapTimestampDataDump) {
+                    sbBufferFormatted = mapTimestampDataDump.get(timeForwardingMilliSeconds);
+                    if (sbBufferFormatted == null) {
+                        this.bytesIndex = 0;
+                        this.bytesOffset = 0;
+                        this.sbDataHex = new StringBuffer();
+                        this.sbDataChar = new StringBuffer();
+                        sbBufferFormatted = new StringBuffer();
+                        mapTimestampDataDump.put(timeForwardingMilliSeconds, sbBufferFormatted);
+                    }
                 }
+            } else if (Protocol.UDP == protocol) {
+                // For UDP, we use a fresh buffer for every packet to avoid thread interleaving
+                // and ensure every packet starts at Offset 000000 in the log.
+                this.bytesIndex = 0;
+                this.bytesOffset = 0;
+                this.sbDataHex = new StringBuffer();
+                this.sbDataChar = new StringBuffer();
+                this.sbBufferFormatted = new StringBuffer();
             }
             // Dump data in Hex and Ascii in DUMP_WIDTH bytes blocks
             for (int bufferOffset = 0; bufferOffset < bytesRead; bufferOffset++) {
                 byte dataByte = buffer[bufferOffset];
                 if (bytesOffset == 0) {
                     // Header row with record details
-                    sbBufferFormatted
-                            .append(String.format("Thread %06x: %s: %s:%s -> %s:%s", threadId,
-                                    localDateTimeForwarding.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
-                                    inputSocket.getInetAddress().getHostAddress(), inputSocket.getPort(),
-                                    outputSocket.getInetAddress().getHostAddress(), outputSocket.getPort()))
-                            .append(System.lineSeparator());
+                    sbBufferFormatted.append(String.format("Thread %06x: %s: %s:%s -> %s:%s", threadId,
+                            localDateTimeForwarding.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
+                            inputAddress, inputPort, outputAddress, outputPort)).append(System.lineSeparator());
                     // Header row with hex offsets of bytes in formatted data dump
                     sbBufferFormatted.append("  Offset ");
                     for (int i = 0; i < DUMP_WIDTH; i++) {
@@ -850,8 +944,11 @@ public class JavaForwarder {
          * @param bytesRead               number of valid bytes in buffer
          * @param direction               CLIENT_TO_SERVER (request) or SERVER_TO_CLIENT (response)
          */
-        private void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead,
+        public void recordHttp(final LocalDateTime localDateTimeForwarding, final byte[] buffer, final int bytesRead,
                 final Direction direction) {
+            if (Protocol.TCP != protocol) {
+                return;
+            }
             if (JavaForwarder.getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) == null) {
                 return;
             }
@@ -869,8 +966,7 @@ public class JavaForwarder {
                     sbBufferFormatted
                             .append(String.format("Thread %06x: %s: %s:%s -> %s:%s [HTTP %s]", threadId,
                                     localDateTimeForwarding.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
-                                    inputSocket.getInetAddress().getHostAddress(), inputSocket.getPort(),
-                                    outputSocket.getInetAddress().getHostAddress(), outputSocket.getPort(),
+                                    inputAddress, inputPort, outputAddress, outputPort,
                                     direction == Direction.CLIENT_TO_SERVER ? "REQUEST" : "RESPONSE"))
                             .append(System.lineSeparator());
                     sbBufferFormatted.append("  Offset ");
@@ -1010,11 +1106,21 @@ public class JavaForwarder {
          * </p>
          */
         private void logDataDump() {
-            synchronized (mapTimestampDataDump) {
-                for (Entry<Long, StringBuffer> mapEntry : mapTimestampDataDump.entrySet()) {
-                    System.out.print(mapEntry.getValue());
+            if (Protocol.TCP == protocol) {
+                // For TCP, maintain the synchronized global sorting logic
+                synchronized (mapTimestampDataDump) {
+                    for (Entry<Long, StringBuffer> mapEntry : mapTimestampDataDump.entrySet()) {
+                        System.out.print(mapEntry.getValue());
+                    }
+                    mapTimestampDataDump.clear();
                 }
-                mapTimestampDataDump.clear();
+            } else if (Protocol.UDP == protocol) {
+                // For UDP, print the thread-local buffer immediately
+                if (sbBufferFormatted != null) {
+                    System.out.print(sbBufferFormatted.toString());
+                    // Clear the reference to free memory and prevent double-printing
+                    sbBufferFormatted = null;
+                }
             }
         }
 
@@ -1364,6 +1470,22 @@ public class JavaForwarder {
             return -1;
         }
 
+        public void setInputAddress(String inputAddress) {
+            this.inputAddress = inputAddress;
+        }
+
+        public void setInputPort(String inputPort) {
+            this.inputPort = inputPort;
+        }
+
+        public void setOutputAddress(String outputAddress) {
+            this.outputAddress = outputAddress;
+        }
+
+        public void setOutputPort(String outputPort) {
+            this.outputPort = outputPort;
+        }
+
     }
 
     /**
@@ -1373,7 +1495,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(final String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.20 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.21 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
@@ -1483,15 +1605,13 @@ public class JavaForwarder {
             // Creating a ServerSocket to listen for connections
             try (DatagramSocket clientDatagramSocket = new DatagramSocket(localPort)) {
                 clientDatagramSocket.setSoTimeout(1000);
-//              while (true) {
                 ClientThread clientThread = new ClientThread(protocol, clientDatagramSocket, remoteHost, remotePort);
                 System.out.println("JavaForwarder accepted client thread ...");
                 clientThreads.add(clientThread);
                 clientThread.start();
-//              }
                 while (!JavaForwarder.doExit) {
                     try {
-                        Thread.sleep(10000);
+                        Thread.sleep(1000);
                     } catch (InterruptedException e) {
                     }
                 }
@@ -1510,7 +1630,7 @@ public class JavaForwarder {
             }
             while (!JavaForwarder.doExit) {
                 try {
-                    Thread.sleep(10000);
+                    Thread.sleep(1000);
                 } catch (InterruptedException e) {
                 }
             }
@@ -1519,6 +1639,7 @@ public class JavaForwarder {
             try {
                 clientThread.connectionBroken();
                 clientThread.join();
+                System.out.flush();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
