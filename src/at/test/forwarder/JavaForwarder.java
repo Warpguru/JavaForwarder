@@ -34,15 +34,29 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
 /**
- * JavaForwarder is a simple {@code TCP} bridging software that allows a {@code TCP} port on some host to be transparently
- * forwarded to some other {@code TCP} port on some other host. JavaForwarder continuously accepts client connections on the
- * listening {@code TCP} port (source port) and starts a thread (ClientThread) that connects to the destination host and starts
- * forwarding the data between the client socket and destination socket.
+ * JavaForwarder is a simple {@code TCP} and {@code UDP} bridging software that allows a {@code TCP} or {@code UDP} port on some
+ * host to be transparently forwarded to some other {@code TCP} or {@code UDPs} port on some other host. JavaForwarder
+ * continuously accepts client connections on the listening {@code TCP} or {@code UDP} port (source port) and starts a thread
+ * (ClientThread) that connects to the destination host and starts forwarding the data between the client socket and destination
+ * sockets or datagram sockets.
  * 
- * Run test Node HTTP server to test with chunked messages (request to http://localhost:3000/ retrieves 1. / and 2.
- * /favicon.ico): <xmp> node -e
- * "require('http').createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/plain'});res.end('Hello
- * World!\n');}).listen(3000)" </xmp>
+ * Run a {@code NodeJS} HTTP server to test chunked messages (request to http://localhost:3000/ retrieves 1. / and 2.
+ * /favicon.ico):
+ * 
+ * <pre>
+ * node -e "require('http').createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/plain'});res.end('Hello World!\n');}).listen(3000)"
+ * </pre>
+ * 
+ * To test {@code UDP} e.g. {@code IPerf3} can be used, though quite some setup is required:
+ * 
+ * <pre>
+ * 1. Run the IPerf3 server on localhost: IPerf3 -V -s
+ * 2. Forward the TCP control connection: java -jar -DDUMP=true -DDUMP_WIDTH=32 JavaForwarder.jar localhost 5201 5202
+ * 3. Forward the UDP connection: java -jar -DMODE=UDP -DDUMP=true -DDUMP_WIDTH=32 d:\JavaForwarder.jar localhost 5201 5202
+ * 4. Run the IPerf3 client on localhost: IPerf3.exe -p 5202 -c 127.0.0.1 -u
+ * </pre>
+ * 
+ * This will execute for both TCP and UDP communication: IPerf3 client <-> JavaForwarder <-> IPerf3 server
  */
 public class JavaForwarder {
 
