@@ -741,6 +741,8 @@ public class JavaForwarder {
         private StringBuilder httpHeaderBuffer = new StringBuilder();
         /** Stored Content-Encoding header value for decompression. */
         private String httpContentEncoding = null;
+        /** Stored Content-Type header value for body formatting decision. */
+        private String httpContentType = null;        
         /** Raw body bytes accumulated for decompression. */
         private ByteArrayOutputStream httpRawBodyStream = new ByteArrayOutputStream();
         /** Flag indicating if we're currently in headers or body. */
@@ -1007,6 +1009,7 @@ public class JavaForwarder {
                         String headers = httpHeaderBuffer.toString();
 
                         httpContentEncoding = extractHeader(headers, "Content-Encoding");
+                        httpContentType = extractHeader(headers, "Content-Type"); 
                         String transferEncoding = extractHeader(headers, "Transfer-Encoding");
                         isChunkedEncoding = "chunked".equalsIgnoreCase(transferEncoding);
 
@@ -1085,7 +1088,7 @@ public class JavaForwarder {
                     byte[] rawBody = httpRawBodyStream.toByteArray();
                     byte[] cleanBody = isChunkedEncoding ? removeChunkEncoding(rawBody) : rawBody;
                     byte[] decodedBody = decompressBody(cleanBody, httpContentEncoding);
-                    appendIndentedBodyWithWidth(decodedBody);
+                    appendIndentedBodyWithWidth(decodedBody, httpContentType);
                 }
             }
             httpRawFullStream = new ByteArrayOutputStream();
@@ -1414,17 +1417,26 @@ public class JavaForwarder {
          * </p>
          * 
          * @param bodyBytes the body bytes (already decompressed and de-chunked)
+         * @param contentType optional {@code Mime} type
          */
-        private void appendIndentedBodyWithWidth(final byte[] bodyBytes) {
-            if (bodyBytes.length == 0)
+        private void appendIndentedBodyWithWidth(final byte[] bodyBytes, final String contentType) {
+            if (bodyBytes.length == 0) {
                 return;
-            boolean isText = true;
-            for (byte b : bodyBytes) {
-                if (b < 32 && b != '\r' && b != '\n' && b != '\t') {
-                    isText = false;
-                    break;
-                }
             }
+            // Determine if body is text with highest precedence from Content-Type MIME type
+            boolean isText = isTextContentType(contentType);            
+            // If no known text MIME type, fall back to UTF-8 decode attempt
+            if (!isText) {
+                try {
+                    java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8.newDecoder();
+                    decoder.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT);
+                    decoder.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+                    decoder.decode(java.nio.ByteBuffer.wrap(bodyBytes));
+                    isText = true;
+                } catch (Exception e) {
+                    isText = false;
+                }
+            }            
             if (isText) {
                 String bodyText = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
                 String[] lines = bodyText.split("\n", -1);
@@ -1459,6 +1471,27 @@ public class JavaForwarder {
             }
         }
 
+        /**
+         * Check if Content-Type indicates text content that can be displayed as a string.
+         * 
+         * @param contentType the Content-Type header value, may be null
+         * @return true if the content type is a known text format
+         */
+        private boolean isTextContentType(final String contentType) {
+            if (contentType == null) return false;
+            String ct = contentType.toLowerCase();
+            return ct.startsWith("text/")
+                || ct.contains("application/json")
+                || ct.contains("application/xml")
+                || ct.contains("application/xhtml")
+                || ct.contains("application/x-www-form-urlencoded")
+                || ct.contains("application/javascript")
+                || ct.contains("application/ld+json")
+                || ct.contains("application/graphql")
+                || ct.contains("+json")
+                || ct.contains("+xml");
+        }
+        
         /**
          * Find the next CRLF (Carriage Return + Line Feed) sequence in a byte array.
          * 
