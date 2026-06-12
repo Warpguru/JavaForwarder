@@ -86,18 +86,25 @@ classDiagram
     class ClientThread {
         -Protocol protocol
         -Socket clientSocket
+        -DatagramSocket clientDatagramSocket
         -Socket serverSocket
+        -DatagramSocket serverDatagramSocket
         -String remoteHost
         -int remotePort
+        -volatile SocketAddress clientAddress
         -boolean forwardingActive
         -volatile Format detectedFormat
         -Object formatDetectionLock
-        -Map~Direction,Boolean~ directionActive
+        -volatile Map~Direction,Boolean~ directionActive
         +void run()
         +Format detectFormat(byte[], int)
         +Format getDetectedFormat()
         +synchronized void forwardingDirectionComplete(Direction)
         +synchronized void connectionBroken()
+        +String getRemoteHost()
+        +int getRemotePort()
+        +SocketAddress getClientAddress()
+        +void setClientAddress(SocketAddress)
         -boolean isHttpTraffic(byte[], int)
     }
     
@@ -116,21 +123,29 @@ classDiagram
     class DataDumpManager {
         -static Map~Long,StringBuffer~ mapTimestampDataDump
         -Long threadId
-        -Socket inputSocket
-        -Socket outputSocket
+        -Protocol protocol
+        -String inputAddress
+        -String inputPort
+        -String outputAddress
+        -String outputPort
         -int DUMP_WIDTH
         -StringBuilder httpHeaderBuffer
         -String httpContentEncoding
+        -String httpContentType
         -ByteArrayOutputStream httpRawBodyStream
         -ByteArrayOutputStream httpRawFullStream
         -boolean inHttpBody
         -boolean isChunkedEncoding
         +void record(LocalDateTime, byte[], int)
+        +void record(LocalDateTime, DatagramPacket)
         +void recordHttp(LocalDateTime, byte[], int, Direction)
         +void resetHttpState()
         +void logDataDump()
         -void appendRawHexDump(byte[])
-        -void appendIndentedBodyWithWidth(byte[])
+        -void appendIndentedBodyWithWidth(byte[], String)
+        -String formatJson(String, String)
+        -boolean isJsonContentType(String)
+        -boolean isTextContentType(String)
         -String extractHeader(String, String)
         -byte[] extractBodyBytes(byte[], int, int)
         -byte[] decompressBody(byte[], String)
@@ -312,20 +327,26 @@ stateDiagram-v2
 flowchart TD
     A[forwardingDirectionComplete<br/>called with direction] --> B[Set directionActive<br/>direction = false]
     
-    B --> C{direction ==<br/>SERVER_TO_CLIENT?}
+    B --> P{protocol == UDP?}
+    P -->|Yes| Q[Close BOTH datagram sockets<br/>clientDatagramSocket<br/>serverDatagramSocket]
+    Q --> G
+    
+    P -->|No| C{direction ==<br/>SERVER_TO_CLIENT?}
     
     C -->|Yes| D{clientSocket<br/>not closed?}
-    D -->|Yes| E[Close clientSocket]
+    D -->|Yes| E[Close clientSocket<br/>to unblock C→S thread]
     D -->|No| G
     E --> G
     
     C -->|No| F{serverSocket<br/>not closed?}
-    F -->|Yes| H[Close serverSocket]
+    F -->|Yes| H[Close serverSocket<br/>to unblock S→C thread]
     F -->|No| G
     H --> G
     
     G[Return - let connectionBroken<br/>handle final cleanup]
 ```
+
+**Note for UDP:** Unlike TCP which supports half-close semantics, UDP has no notion of a graceful directional shutdown. When either UDP forwarding direction terminates, both datagram sockets are closed immediately to unblock the other thread blocked on `receive()`.
 
 ### connectionBroken() Logic
 
@@ -349,7 +370,7 @@ flowchart TD
 
 ### Buffer-Based Data Forwarding
 
-Each ForwardThread reads data in chunks of up to `BUFFER_SIZE` (8192 bytes):
+Each ForwardThread reads data in chunks of up to `BUFFER_SIZE` (65536 bytes):
 
 ```mermaid
 sequenceDiagram
@@ -394,9 +415,9 @@ graph TD
 ```
 
 **Example:**
-- Large HTTP response (10KB):
-  - Read 1: 8192 bytes @ timestamp T1 → keep timestamp
-  - Read 2: 1808 bytes @ timestamp T1 → reset timestamp
+- Large HTTP response (100KB):
+  - Read 1: 65536 bytes @ timestamp T1 → keep timestamp
+  - Read 2: 36864 bytes @ timestamp T1 → reset timestamp
 - Small HTTP request (500 bytes):
   - Read: 500 bytes @ timestamp T2 → reset timestamp
 
@@ -557,6 +578,7 @@ When `DUMP_HTTP` is enabled and HTTP traffic is detected, JavaForwarder provides
 | Chunked encoding handling | Raw display | Clean body without chunk markers |
 | Compression handling | Raw compressed bytes | Decompressed content |
 | Format detection | None | Automatic HTTP detection |
+| Content-Type aware rendering | ❌ | ✅ (JSON pretty-print, text, binary hex) |
 
 ### Output Format
 
@@ -620,10 +642,17 @@ flowchart TD
     J -->|gzip| K[GZIP decompress]
     J -->|deflate| L[Deflate decompress]
     J -->|No| M[Use as-is]
-    K --> N[Output body with indent<br/>appendIndentedBodyWithWidth]
+    K --> N[appendIndentedBodyWithWidth<br/>decodedBody, httpContentType]
     L --> N
     M --> N
-    N --> O[Reset all HTTP state]
+    N --> N1{Render mode<br/>by Content-Type}
+    N1 -->|JSON| N2[Pretty-print via formatJson<br/>2-space indent per level]
+    N1 -->|Text| N3[Plain text<br/>2-space indent per line]
+    N1 -->|Binary| N4[Hex dump with label<br/>'Binary body - hex dump']
+    N2 --> O
+    N3 --> O
+    N4 --> O
+    O[Reset all HTTP state<br/>including httpContentType]
 ```
 
 ### Chunked Transfer Encoding
@@ -664,8 +693,37 @@ If decompression fails (corrupt data), the raw bytes are displayed with an error
 | `httpRawBodyStream` | Accumulates raw body bytes (for decompression) |
 | `httpRawFullStream` | Accumulates ALL raw bytes (for hex dump) |
 | `httpContentEncoding` | Extracted from headers for decompression |
+| `httpContentType` | Extracted from Content-Type header for body render-mode selection (JSON / text / binary) |
 | `isChunkedEncoding` | Extracted from Transfer-Encoding header |
 | `inHttpBody` | State flag: parsing headers vs body |
+
+### Body Rendering Modes
+
+After the body has been de-chunked and decompressed, `appendIndentedBodyWithWidth(byte[] bodyBytes, String contentType)` selects one of three render modes based on the `Content-Type` header (with a UTF-8 decode fallback when no recognized MIME type is present):
+
+| Render Mode | Detection | Output Style |
+|-------------|-----------|--------------|
+| **JSON** | `isJsonContentType(contentType)` matches `application/json`, `application/ld+json`, `application/graphql`, or any `+json` suffix | Pretty-printed via `formatJson()` — newlines after `{`, `[`, `,`; 2-space indent per nesting depth; empty `{}`/`[]` kept inline. Each output line is prefixed with 2 spaces for alignment with headers |
+| **Text** | `isTextContentType(contentType)` matches `text/*`, `application/xml`, `application/xhtml`, `application/x-www-form-urlencoded`, `application/javascript`, `+json` or `+xml` suffixes — OR a UTF-8 decode of the body succeeds without errors | Decoded as UTF-8, each line prefixed with 2 spaces, original line breaks preserved |
+| **Binary** | All other cases (binary content type, non-decodable bytes) | Header line `[Binary body - hex dump]` followed by an indented hex dump (offset + DUMP_WIDTH bytes hex + ASCII column, dots for non-printable) |
+
+### JSON Pretty-Printing
+
+The `formatJson(String json, String indent)` helper is a self-contained pretty-printer (no external libraries) that:
+
+- Tracks string state (with backslash escape handling) so structural characters inside strings are not reformatted
+- Inserts a newline + indentation after `{`, `[`, and `,`
+- Inserts a newline + indentation before `}` and `]`
+- Renders `:` as `": "` for compact key/value pairs
+- Detects empty `{}` / `[]` via lookahead and keeps them on a single line
+- Falls back gracefully on malformed input (no exceptions thrown)
+
+### Content-Type Helper Methods
+
+| Method | Purpose |
+|--------|---------|
+| `isJsonContentType(String)` | Returns true for JSON-bearing MIME types: `application/json`, `application/ld+json`, `application/graphql`, and any `+json` suffix |
+| `isTextContentType(String)` | Returns true for any displayable text MIME type, including `text/*`, XML/JSON variants, form-urlencoded, JavaScript, and `+json` / `+xml` suffixes |
 
 ---
 
@@ -743,7 +801,7 @@ sequenceDiagram
 ## Typical Log Output
 
 ```
-JavaForwarder v1.13 (C) by Roman.Stangl@gmx.net
+JavaForwarder v1.23 (C) by Roman.Stangl@gmx.net
 JavaForwarder starting proxy thread, forwarding TCP connection: localhost:3000 on local port 80
 JavaForwarder proxy thread waiting for client connection(s) ...
 JavaForwarder waiting for client connection(s), press Enter to terminate JavaForwarder ...
