@@ -1423,8 +1423,9 @@ public class JavaForwarder {
             if (bodyBytes.length == 0) {
                 return;
             }
-            // Determine if body is text with highest precedence from Content-Type MIME type
-            boolean isText = isTextContentType(contentType);            
+            // Determine display format with highest precedence from Content-Type MIME type
+            boolean isJson = isJsonContentType(contentType);
+            boolean isText = isJson || isTextContentType(contentType);            
             // If no known text MIME type, fall back to UTF-8 decode attempt
             if (!isText) {
                 try {
@@ -1436,8 +1437,22 @@ public class JavaForwarder {
                 } catch (Exception e) {
                     isText = false;
                 }
-            }            
-            if (isText) {
+            }
+            if (isJson) {
+                // Pretty-print JSON with 2-space base indent
+                String rawJson = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+                String formattedJson = formatJson(rawJson, "  ");
+                String[] lines = formattedJson.split("\n", -1);
+                for (int i = 0; i < lines.length; i++) {
+                    if (i == lines.length - 1 && lines[i].isEmpty()) {
+                        break;
+                    }
+                    sbBufferFormatted.append("  ").append(lines[i]);
+                    if (i < lines.length - 1) {
+                        sbBufferFormatted.append(System.lineSeparator());
+                    }
+                }
+            } else if (isText) {
                 String bodyText = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
                 String[] lines = bodyText.split("\n", -1);
                 for (int i = 0; i < lines.length; i++) {
@@ -1472,7 +1487,105 @@ public class JavaForwarder {
         }
 
         /**
-         * Check if Content-Type indicates text content that can be displayed as a string.
+         * Pretty-print JSON string with indentation.
+         * Self-contained implementation using no external libraries.
+         * Handles strings (including escaped quotes), arrays, objects.
+         * Falls back to original string if input is not valid JSON structure.
+         *
+         * @param json   the raw JSON string (may be compact or already formatted)
+         * @param indent the base indent prefix to apply to each level
+         * @return pretty-printed JSON string
+         */
+        private String formatJson(final String json, final String indent) {
+            StringBuilder sb = new StringBuilder();
+            int depth = 0;
+            boolean inString = false;
+            boolean escape = false;
+            char[] chars = json.toCharArray();
+            
+            for (int i = 0; i < chars.length; i++) {
+                char c = chars[i];
+                
+                if (escape) {
+                    sb.append(c);
+                    escape = false;
+                    continue;
+                }
+                if (c == '\\' && inString) {
+                    sb.append(c);
+                    escape = true;
+                    continue;
+                }
+                if (c == '"') {
+                    inString = !inString;
+                    sb.append(c);
+                    continue;
+                }
+                if (inString) {
+                    sb.append(c);
+                    continue;
+                }
+                
+                // Structural characters - skip existing whitespace between tokens
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                    continue;
+                }
+                
+                switch (c) {
+                    case '{':
+                    case '[':
+                        sb.append(c);
+                        // Peek ahead: if next non-whitespace is closing bracket, keep on same line
+                        int next = i + 1;
+                        while (next < chars.length && (chars[next] == ' ' || chars[next] == '\t' || chars[next] == '\r' || chars[next] == '\n')) next++;
+                        if (next < chars.length && ((c == '{' && chars[next] == '}') || (c == '[' && chars[next] == ']'))) {
+                            // Empty object/array - skip depth change
+                        } else {
+                            depth++;
+                            sb.append('\n');
+                            for (int d = 0; d < depth; d++) sb.append(indent);
+                        }
+                        break;
+                    case '}':
+                    case ']':
+                        // Check if previous non-whitespace output ends in { or [
+                        depth = Math.max(0, depth - 1);
+                        sb.append('\n');
+                        for (int d = 0; d < depth; d++) sb.append(indent);
+                        sb.append(c);
+                        break;
+                    case ',':
+                        sb.append(c);
+                        sb.append('\n');
+                        for (int d = 0; d < depth; d++) sb.append(indent);
+                        break;
+                    case ':':
+                        sb.append(": ");
+                        break;
+                    default:
+                        sb.append(c);
+                }
+            }
+            return sb.toString();
+        }
+
+        /**
+         * Check if {@code Content-Type} indicates {@code Json} format.
+         * 
+         * @param contentType the Content-Type header value, may be null
+         * @return true if the content type is Json format
+         */
+        private boolean isJsonContentType(final String contentType) {
+            if (contentType == null) return false;
+            String ct = contentType.toLowerCase();
+            return ct.contains("application/json")
+                || ct.contains("application/ld+json")
+                || ct.contains("application/graphql")
+                || ct.contains("+json");
+        }
+        
+        /**
+         * Check if {@code Content-Type} indicates text content that can be displayed as a {@link String}.
          * 
          * @param contentType the Content-Type header value, may be null
          * @return true if the content type is a known text format
@@ -1542,7 +1655,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     public static void main(final String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.21 (C) by Roman.Stangl@gmx.net");
+        System.out.println("JavaForwarder v1.23 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
