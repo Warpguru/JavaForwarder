@@ -1,12 +1,14 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	
 	<modelVersion>4.0.0</modelVersion>
-	<groupId>JavaForwarder</groupId>
+	<groupId>edu.java</groupId>
 	<artifactId>JavaForwarder</artifactId>
-	<version>1.0.0</version>
+	<packaging>jar</packaging>
+	<version>1.23.0</version>
 	<name>JavaForwarder</name>
-	<description>JavaForwarder reverse proxy</description>
+	<description>JavaForwarder reverse proxy to monitor/log TCP (HTTP) and UDP traffic</description>
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -15,9 +17,34 @@
 		<maven.compiler.target>8</maven.compiler.target>
 	</properties>
 
+	<dependencies>
+		<!-- https://mvnrepository.com/artifact/org.apache.logging.log4j/log4j-core -->
+		<dependency>
+		    <groupId>org.apache.logging.log4j</groupId>
+		    <artifactId>log4j-core</artifactId>
+		    <version>2.24.3</version>
+		</dependency>
+		<dependency>
+		    <groupId>org.apache.logging.log4j</groupId>
+		    <artifactId>log4j-api</artifactId>
+		    <version>2.24.3</version>
+		</dependency>		
+	</dependencies>
+
+
 	<build>
 		<sourceDirectory>src</sourceDirectory>
 
+        <resources>
+            <resource>
+                <directory>src</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>**/log4j2.xml</include>
+                </includes>
+            </resource>
+        </resources>
+        
 		<plugins>
 			<plugin>
 				<artifactId>maven-compiler-plugin</artifactId>
@@ -37,12 +64,45 @@
 							<addClasspath>true</addClasspath>
 							<classpathPrefix>libs/</classpathPrefix>
 							<mainClass>
-								at.test.forwarder.JavaForwarder
+								edu.java.ResourceMonitor
 							</mainClass>
 						</manifest>
 					</archive>
 				</configuration>
 			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<version>3.6.0</version>
+				<executions>
+					<execution>
+						<phase>package</phase>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<configuration>
+							<transformers>
+								<transformer
+									implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+									<mainClass>edu.java.JavaForwarder</mainClass>
+								</transformer>
+							</transformers>
+                            <filters>
+								<!-- Prevent error: java.lang.SecurityException: Invalid signature file digest for Manifest main attributes -->
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>							
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+
 		</plugins>
 
 	</build>
