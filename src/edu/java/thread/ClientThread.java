@@ -9,6 +9,9 @@ import java.net.SocketAddress;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import edu.java.JavaForwarder;
 import edu.java.helper.Direction;
 import edu.java.helper.Format;
@@ -20,6 +23,11 @@ import edu.java.helper.Protocol;
  * performed by two ForwardThread instances.
  */
 public class ClientThread extends Thread {
+
+    /** Default logger (using appender that includes e.g. timestamp, ...). */
+    private static final Logger logger = LogManager.getLogger(ClientThread.class);
+    /** Sysout logger (logging to sysout without formatting and logfile with formatting). */
+    private static final Logger loggerSysout = LogManager.getLogger(JavaForwarder.LOGGER_SYSOUT);
 
     /** {@link JavaForwarder} instance running. */
     private JavaForwarder javaForwarder;
@@ -118,7 +126,7 @@ public class ClientThread extends Thread {
             /** {@link InputStream} to write data to {@code localhost:localPort}. */
             OutputStream serverOutputStream;
             try {
-                System.out.println("JavaForwarder connecting to server ...");
+                loggerSysout.info("Connecting to server ...");
                 // Connect to the destination server
                 serverSocket = new Socket(remoteHost, remotePort);
                 // Turn on keep-alive for both the sockets
@@ -129,13 +137,13 @@ public class ClientThread extends Thread {
                 clientOutputStream = clientSocket.getOutputStream();
                 serverInputStream = serverSocket.getInputStream();
                 serverOutputStream = serverSocket.getOutputStream();
-                System.out.println("JavaForwarder connected to server");
+                loggerSysout.info("Connected to server");
             } catch (IOException ioe) {
-                System.err.println("JavaForwarder failed to connect to initiate " + protocol + " connection: " + remoteHost
-                        + ":" + remotePort);
+                loggerSysout
+                        .error("Failed to connect to initiate " + protocol + " connection: " + remoteHost + ":" + remotePort);
                 connectionBroken();
                 javaForwarder.setDoExit(true);
-                System.out.println("JavaForwarder failed to start, press Enter to terminate JavaForwarder ...");
+                loggerSysout.info("Failed to start, press Enter to terminate JavaForwarder ...");
                 return;
             }
             // Start forwarding data between client and server
@@ -146,24 +154,24 @@ public class ClientThread extends Thread {
             ForwardThread serverForward = new ForwardThread(javaForwarder, this, protocol, serverSocket, clientSocket,
                     serverInputStream, clientOutputStream, Direction.SERVER_TO_CLIENT);
             serverForward.start();
-            System.out.println("JavaForwarder " + protocol + " connection: " + clientSocket.getInetAddress().getHostAddress()
+            loggerSysout.info("" + protocol + " connection: " + clientSocket.getInetAddress().getHostAddress()
                     + ":" + clientSocket.getPort() + " <--> " + serverSocket.getInetAddress().getHostAddress() + ":"
                     + serverSocket.getPort() + " started");
         } else if (Protocol.UDP == protocol) {
             try {
-                System.out.println("JavaForwarder connecting to server ...");
+                loggerSysout.info("Connecting to server ...");
                 // Connect to the destination server
                 serverDatagramSocket = new DatagramSocket();
                 // TODO: Remove once it is working
                 // serverDatagramSocket.connect(InetAddress.getByName(remoteHost), remotePort);
-                System.out.println("JavaForwarder connected to server (UDP)");
+                loggerSysout.info("Connected to server (UDP)");
             } catch (Exception e) {
                 e.printStackTrace();
-                System.err.println("JavaForwarder failed to connect to initiate " + protocol + " connection: " + remoteHost
+                loggerSysout.error("Failed to connect to initiate " + protocol + " connection: " + remoteHost
                         + ":" + remotePort);
                 connectionBroken();
                 javaForwarder.setDoExit(true);
-                System.out.println("JavaForwarder failed to start, press Enter to terminate JavaForwarder ...");
+                loggerSysout.info("Failed to start, press Enter to terminate JavaForwarder ...");
                 return;
             }
             // Start forwarding data between server and client
@@ -186,7 +194,7 @@ public class ClientThread extends Thread {
      */
     public synchronized void forwardingDirectionComplete(final Direction direction) {
         directionActive.put(direction, false);
-        System.out.println("JavaForwarder " + direction + " forwarding completed");
+        logger.info("JavaForwarder " + direction + " forwarding completed");
         // For UDP, if one direction finishes, close both sockets to unblock the other thread
         if (protocol == Protocol.UDP) {
             if (serverDatagramSocket != null)
@@ -200,7 +208,7 @@ public class ClientThread extends Thread {
             try {
                 // Close client socket to make CLIENT_TO_SERVER thread exit
                 clientSocket.close();
-                System.out.println("JavaForwarder closed client socket to unblock CLIENT_TO_SERVER");
+                logger.info("JavaForwarder closed client socket to unblock CLIENT_TO_SERVER");
             } catch (Exception e) {
                 // Ignore - socket may already be closed
             }
@@ -211,7 +219,7 @@ public class ClientThread extends Thread {
             try {
                 // Close server socket to make SERVER_TO_CLIENT thread exit
                 serverSocket.close();
-                System.out.println("JavaForwarder closed server socket to unblock SERVER_TO_CLIENT");
+                logger.info("JavaForwarder closed server socket to unblock SERVER_TO_CLIENT");
             } catch (Exception e) {
                 // Ignore - socket may already be closed
             }
@@ -252,7 +260,7 @@ public class ClientThread extends Thread {
                 return detectedFormat;
             }
             detectedFormat = isHttpTraffic(buffer, length) ? Format.HTTP : Format.OTHER;
-            System.out.println("JavaForwarder detected traffic format: " + detectedFormat);
+            logger.info("Detected traffic format: " + detectedFormat);
             return detectedFormat;
         }
     }
@@ -287,11 +295,11 @@ public class ClientThread extends Thread {
         // Check if any direction is still active
         boolean anyDirectionActive = directionActive.values().stream().anyMatch(active -> active);
         if (anyDirectionActive) {
-            System.out.println("JavaForwarder one direction closed, waiting for other direction");
+            loggerSysout.info("One direction closed, waiting for other direction");
             return; // Don't close yet - other direction still active
         }
         // Both directions finished - now close everything
-        System.out.println("JavaForwarder both directions closed, terminating connection");
+        loggerSysout.info("Both directions closed, terminating connection");
         if (serverSocket != null && !serverSocket.isClosed()) {
             try {
                 serverSocket.close();
@@ -318,13 +326,13 @@ public class ClientThread extends Thread {
         }
         if (forwardingActive) {
             if (Protocol.TCP == protocol) {
-                System.out.println("JavaForwarder " + protocol + " connection: "
+                loggerSysout.info("JavaForwarder " + protocol + " connection: "
                         + clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort() + " <--> "
                         + serverSocket.getInetAddress().getHostAddress() + ":" + serverSocket.getPort() + " stopped");
             }
             if (Protocol.UDP == protocol) {
                 if (clientDatagramSocket.getInetAddress() != null) {
-                    System.out.println("JavaForwarder " + protocol + " connection: "
+                    loggerSysout.info("JavaForwarder " + protocol + " connection: "
                             + clientDatagramSocket.getInetAddress().getHostAddress() + ":" + clientDatagramSocket.getPort()
                             + " <--> " + serverDatagramSocket.getInetAddress().getHostAddress() + ":"
                             + serverDatagramSocket.getPort() + " stopped");

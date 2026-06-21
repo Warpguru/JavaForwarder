@@ -14,6 +14,9 @@ import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import edu.java.helper.Protocol;
 import edu.java.thread.ClientThread;
 import edu.java.thread.ProxyThread;
@@ -45,6 +48,8 @@ import edu.java.thread.ProxyThread;
  */
 public class JavaForwarder {
 
+    /** Logger to sysout without formatting and logfile with formatting. */
+    public static final String LOGGER_SYSOUT = "edu.java.Sysout";
     /** Mode of forwarding operation, {@code TCP} (default) or {@code UDP}. */
     public static final String ENVIRONMENT_VARIABLE_MODE = "MODE";
     /** Set to any value to activate recording of the forwarded data in a formatted data dump. */
@@ -56,6 +61,11 @@ public class JavaForwarder {
 
     /** Flag checked by threads if they should terminate. */
     private boolean doExit = false;
+
+    /** Default logger (using appender that includes e.g. timestamp, ...). */
+    private static final Logger logger = LogManager.getLogger(JavaForwarder.class);
+    /** Sysout logger (logging to sysout without formatting and logfile with formatting). */
+    private static final Logger loggerSysout = LogManager.getLogger(LOGGER_SYSOUT);
 
     /**
      * Main entry point.
@@ -75,7 +85,7 @@ public class JavaForwarder {
      * @throws IOException
      */
     private void run(final String[] args) throws IOException {
-        System.out.println("JavaForwarder v1.24 (C) by Roman.Stangl@gmx.net");
+        loggerSysout.info("JavaForwarder v1.25 (C) by Roman.Stangl@gmx.net");
         try {
             String remoteHost = "localhost";
             int remotePort = 9080;
@@ -86,15 +96,15 @@ public class JavaForwarder {
                 remotePort = Integer.valueOf(args[1]);
                 localPort = Integer.valueOf(args[2]);
             } else {
-                System.out.println("");
-                System.out.println("Usage: JavaForwarder remoteHost remotePort localPort");
-                System.out.println("");
-                System.out.println("  Supported optional environment variables:");
-                System.out.println("    MODE ... forward TCP (default) or UDP data");
-                System.out.println("    DUMP ... any value to record data forwarded as formatted data dump");
-                System.out.println("    DUMP_HTTP ... any value to record data forwarded as formatted HTTP dump");
-                System.out.println("    DUMP_WIDTH ... multiple of 16 defining number of bytes per row of formatted data dump");
-                System.out.println("");
+                loggerSysout.info("");
+                loggerSysout.info("Usage: JavaForwarder remoteHost remotePort localPort");
+                loggerSysout.info("");
+                loggerSysout.info("  Supported optional environment variables:");
+                loggerSysout.info("    MODE ... forward TCP (default) or UDP data");
+                loggerSysout.info("    DUMP ... any value to record data forwarded as formatted data dump");
+                loggerSysout.info("    DUMP_HTTP ... any value to record data forwarded as formatted HTTP dump");
+                loggerSysout.info("    DUMP_WIDTH ... multiple of 16 defining number of bytes per row of formatted data dump");
+                loggerSysout.info("");
                 return;
             }
             // Check IP we want to forward
@@ -104,32 +114,32 @@ public class JavaForwarder {
                 protocol = Protocol.UDP;
             }
             // Printing a start-up message
-            System.out.println("JavaForwarder starting proxy thread, forwarding " + protocol + " connection: " + remoteHost
-                    + ":" + remotePort + " on local port " + localPort);
+            loggerSysout.info("Starting proxy thread, forwarding " + protocol + " connection: " + remoteHost + ":" + remotePort
+                    + " on local port " + localPort);
             // And start running the server
             ProxyThread proxyThread = new ProxyThread(this, protocol, remoteHost, remotePort, localPort);
             proxyThread.start();
             Thread.sleep(500);
             // Check if proxy thread is still alive after startup
             if (!proxyThread.isAlive()) {
-                System.out.println("JavaForwarder startup failed, exiting ...");
+                loggerSysout.info("Startup failed, exiting ...");
                 return;
             }
             // Wait for quitting
-            System.out.println("JavaForwarder waiting for client connection(s), press Enter to terminate JavaForwarder ...");
+            loggerSysout.info("Waiting for client connection(s), press Enter to terminate JavaForwarder ...");
             try {
                 System.in.read();
             } catch (Exception e) {
                 // Ignore
             }
             if (proxyThread.isAlive()) {
-                System.out.println("JavaForwarder termination requested, waiting for proxy thread ...");
+                loggerSysout.info("Termination requested, waiting for proxy thread ...");
             }
             setDoExit(true);
             proxyThread.join();
-            System.out.println("JavaForwarder exiting ...");
+            loggerSysout.info("Exiting ...");
         } catch (Exception e) {
-            System.err.println(e); // Prints the standard errors
+            logger.error(e);
         }
     }
 
@@ -146,7 +156,7 @@ public class JavaForwarder {
      */
     public void runServer(final Protocol protocol, final String remoteHost, final int remotePort, final int localPort)
             throws IOException {
-        System.out.println("JavaForwarder proxy thread waiting for client connection(s) ...");
+        loggerSysout.info("Proxy thread waiting for client connection(s) ...");
         List<ClientThread> clientThreads = new ArrayList<>();
         if (Protocol.TCP == protocol) {
             // Creating a ServerSocket to listen for connections
@@ -159,7 +169,7 @@ public class JavaForwarder {
                         while (true) {
                             Socket clientSocket = serverSocket.accept();
                             ClientThread clientThread = new ClientThread(this, protocol, clientSocket, remoteHost, remotePort);
-                            System.out.println("JavaForwarder accepted client thread ...");
+                            loggerSysout.info("Accepted client thread ...");
                             clientThreads.add(clientThread);
                             clientThread.start();
                         }
@@ -168,9 +178,9 @@ public class JavaForwarder {
                     }
                 }
             } catch (BindException e) {
-                System.err.println("JavaForwarder port " + localPort + " is already in use.");
-                System.err.println(
-                        "JavaForwarder cannot start server. Please check if another instance is running or choose a different port.");
+                loggerSysout.error("Port " + localPort + " is already in use.");
+                loggerSysout
+                        .error("Cannot start server. Please check if another instance is running or choose a different port.");
                 setDoExit(true);
             } finally {
                 if (serverSocket != null && !serverSocket.isClosed()) {
@@ -186,7 +196,7 @@ public class JavaForwarder {
             try (DatagramSocket clientDatagramSocket = new DatagramSocket(localPort)) {
                 clientDatagramSocket.setSoTimeout(1000);
                 ClientThread clientThread = new ClientThread(this, protocol, clientDatagramSocket, remoteHost, remotePort);
-                System.out.println("JavaForwarder accepted client thread ...");
+                loggerSysout.info("Accepted client thread ...");
                 clientThreads.add(clientThread);
                 clientThread.start();
                 while (!isDoExit()) {
@@ -196,9 +206,9 @@ public class JavaForwarder {
                     }
                 }
             } catch (BindException e) {
-                System.err.println("JavaForwarder port " + localPort + " is already in use.");
-                System.err.println(
-                        "JavaForwarder cannot start server. Please check if another instance is running or choose a different port.");
+                loggerSysout.error("Port " + localPort + " is already in use.");
+                loggerSysout
+                        .error("Cannot start server. Please check if another instance is running or choose a different port.");
                 setDoExit(true);
             } catch (SocketException e) {
                 // SocketTimeoutException ?
@@ -224,7 +234,7 @@ public class JavaForwarder {
                 e.printStackTrace();
             }
         }
-        System.out.println("JavaForwarder proxy thread terminating ...");
+        loggerSysout.info("Proxy thread terminating ...");
     }
 
     /**

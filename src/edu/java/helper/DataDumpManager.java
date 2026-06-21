@@ -15,6 +15,9 @@ import java.util.TreeMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import edu.java.JavaForwarder;
 import edu.java.thread.ForwardThread;
 
@@ -22,6 +25,9 @@ import edu.java.thread.ForwardThread;
  * Data dump manager to store data forwarded by the {@link ForwardThread}.
  */
 public class DataDumpManager {
+
+    /** Sysout logger (logging to sysout without formatting and logfile with formatting). */
+    private static final Logger loggerSysout = LogManager.getLogger(JavaForwarder.LOGGER_SYSOUT);
 
     /**
      * Map (shared between threads) of chronological timestamps and formatted traffic between {@code inputSocket} and
@@ -448,14 +454,14 @@ public class DataDumpManager {
             // For TCP, maintain the synchronized global sorting logic
             synchronized (mapTimestampDataDump) {
                 for (Entry<Long, StringBuffer> mapEntry : mapTimestampDataDump.entrySet()) {
-                    System.out.print(mapEntry.getValue());
+                    loggerSysout.info(mapEntry.getValue());
                 }
                 mapTimestampDataDump.clear();
             }
         } else if (Protocol.UDP == protocol) {
             // For UDP, print the thread-local buffer immediately
             if (sbBufferFormatted != null) {
-                System.out.print(sbBufferFormatted.toString());
+                loggerSysout.info(sbBufferFormatted.toString());
                 // Clear the reference to free memory and prevent double-printing
                 sbBufferFormatted = null;
             }
@@ -568,7 +574,7 @@ public class DataDumpManager {
             }
         } catch (IOException e) {
             // Decompression failed, return original with error note
-            System.err.println("JavaForwarder decompression failed (" + contentEncoding + "): " + e.getMessage());
+            loggerSysout.error("Decompression failed (" + contentEncoding + "): " + e.getMessage());
         }
         return rawBody;
     }

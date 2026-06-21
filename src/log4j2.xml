@@ -1,36 +1,51 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Configuration status="WARN">
-
 	<Appenders>
-		<!-- Appender to display application details (logo, help, ...) in plain text -->
+
+		<!-- Plain output for application details, help text, logo, etc. -->
 		<Console name="SysoutAppender" target="SYSTEM_OUT">
 			<PatternLayout pattern="%msg%n" />
 		</Console>
+
+		<!-- Formatted console output for warnings and errors -->
 		<Console name="ConsoleAppender" target="SYSTEM_OUT">
-			<PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%30t] %-5level %-45logger:%4L - %msg%n" />
+			<PatternLayout
+				pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%30t] %-5level %-45logger:%4L - %msg%n" />
+			<ThresholdFilter level="WARN" onMatch="ACCEPT"
+				onMismatch="DENY" />
 		</Console>
-		<RollingFile name="ConsoleFileAppender" filePattern="JavaForwarder-%d{yyyy-MM-dd}.log" immediateFlush="true" append="true">
-			<PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%30t] %-5level %-45logger:%4L - %msg%n" />
-  			<Policies><TimeBasedTriggeringPolicy interval="1"/></Policies>			
+
+		<!-- Log file -->
+		<RollingFile name="ConsoleFileAppender"
+			fileName="JavaForwarder.log"
+			filePattern="JavaForwarder-%d{yyyy-MM-dd}.log" immediateFlush="true"
+			append="true">
+			<PatternLayout
+				pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%30t] %-5level %-45logger:%4L - %msg%n" />
+			<Policies>
+				<TimeBasedTriggeringPolicy interval="1" />
+			</Policies>
 		</RollingFile>
+
 	</Appenders>
-	
 	<Loggers>
-		<Root level="INFO">
+
+		<!-- Plain-text logger: stdout + logfile -->
+		<Logger name="edu.java.Sysout" level="INFO" additivity="false">
+			<AppenderRef ref="SysoutAppender" />
+			<AppenderRef ref="ConsoleFileAppender" />
+		</Logger>
+
+		<!-- Application logging: logfile always, console only WARN+ -->
+		<Logger name="edu.java" level="ALL" additivity="false">
 			<AppenderRef ref="ConsoleAppender" />
+			<AppenderRef ref="ConsoleFileAppender" />
+		</Logger>
+
+		<!-- Catch everything else -->
+		<Root level="INFO">
+			<AppenderRef ref="ConsoleFileAppender" />
 		</Root>
-        <Logger name="edu.java.Sysout" level="INFO" additivity="false">
-            <AppenderRef ref="SysoutAppender">
-            </AppenderRef>
-        </Logger>
-		<!-- Log everything to ConsoleFileAppender but only warnings and higher to console -->
-        <Logger name="edu.java" level="ALL" additivity="false">
-            <AppenderRef ref="ConsoleAppender">
-            	<LevelRangeFilter minLevel="FATAL" maxLevel="INFO" onMatch="ACCEPT" onMismatch="DENY"/>
-            </AppenderRef>
-            <AppenderRef ref="ConsoleFileAppender">
-            </AppenderRef>
-        </Logger>
-    </Loggers>
-    
+
+	</Loggers>
 </Configuration>

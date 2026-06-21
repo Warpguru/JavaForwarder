@@ -13,6 +13,9 @@ import java.net.SocketTimeoutException;
 import java.time.LocalDateTime;
 import java.util.stream.Stream;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import edu.java.JavaForwarder;
 import edu.java.helper.DataDumpManager;
 import edu.java.helper.Direction;
@@ -26,6 +29,11 @@ import edu.java.helper.Protocol;
  */
 public class ForwardThread extends Thread {
 
+    /** Default logger (using appender that includes e.g. timestamp, ...). */
+    private static final Logger logger = LogManager.getLogger(ForwardThread.class);
+    /** Sysout logger (logging to sysout without formatting and logfile with formatting). */
+    private static final Logger loggerSysout = LogManager.getLogger(JavaForwarder.LOGGER_SYSOUT);
+    
     /** Data buffer, for TCP you retrieve in chunks, for UDP only 1 chunk with max. size of 65507 is possible. */
     private static final int BUFFER_SIZE = 65536;
 
@@ -119,12 +127,12 @@ public class ForwardThread extends Thread {
                     .getPropertyOrEnvironmentVariable(JavaForwarder.ENVIRONMENT_VARIABLE_DUMP_HTTP) != null;
             try {
                 while (!javaForwarder.isDoExit()) {
-                    System.out.println("JavaForwarder " + direction + " waiting for data...");
+                    loggerSysout.info("" + direction + " waiting for data...");
                     int bytesRead = inputStream.read(buffer);
-                    System.out.println("JavaForwarder " + direction + " read " + bytesRead + " bytes");
+                    loggerSysout.info("" + direction + " read " + bytesRead + " bytes");
                     // If end of stream is reached --> exit
                     if (bytesRead == -1) {
-                        System.out.println("JavaForwarder " + direction + " EOF detected, exiting");
+                        loggerSysout.info("" + direction + " EOF detected, exiting");
                         break;
                     }
                     // Record timestamp for data read
@@ -194,7 +202,7 @@ public class ForwardThread extends Thread {
                         dataDumpManager.record(LocalDateTime.now(), inputDatagramPacket);
                         dataDumpManager.logDataDump();
                     } catch (PortUnreachableException e) {
-                        System.out.println("JavaForwarder ICMP Port Unreachable (Destination unreachable)");
+                        loggerSysout.info("ICMP Port Unreachable (Destination unreachable)");
                     } catch (SocketTimeoutException e) {
                         // Ignore timeout and continue waiting until we should exist
                     }
