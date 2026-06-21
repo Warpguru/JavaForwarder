@@ -6,7 +6,7 @@
 	<groupId>edu.java</groupId>
 	<artifactId>JavaForwarder</artifactId>
 	<packaging>jar</packaging>
-	<version>1.23.0</version>
+	<version>1.25.0</version>
 	<name>JavaForwarder</name>
 	<description>JavaForwarder reverse proxy to monitor/log TCP (HTTP) and UDP traffic</description>
 
